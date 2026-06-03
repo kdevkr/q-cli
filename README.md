@@ -11,6 +11,8 @@ q-cli [OUT] run    <conn> <path.q>
 q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
+q-cli [OUT] info   <conn>            # version, pid, port, memory, handles
+q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
 q-cli       ping   <conn>
 q-cli       web    <off|get-ok|status> <conn>   # tune built-in HTTP serving
@@ -47,7 +49,10 @@ prod    = bigbox:5001:user:pass
 - `--console` — the q server formats the result with `.Q.s` (max fidelity).
 
 **Subcommands** — `tables` / `meta <t>` / `count <t>` wrap `tables[]` / `meta t` /
-`count t` for quick schema discovery; `gc` runs `.Q.gc[]`.
+`count t` for quick schema discovery; `gc` runs `.Q.gc[]`. `info` returns a
+health snapshot (version/pid/port/used/heap/peak/handles/timer). `time <expr>`
+times the expression on the server and returns `ms` + result `count` (not the
+data) — e.g. `q-cli time @ 'select avg price by sym from trade'`.
 
 **`web` — built-in HTTP serving.** A q process serves IPC *and* HTTP on the same
 port, so a browser to `http://host:port/` gets a default page. Tune it at runtime:

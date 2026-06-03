@@ -102,8 +102,16 @@ fn real_main() -> i32 {
         "meta" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("meta {}", t), out)),
         "count" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("count {}", t), out)),
         "gc" => do_eval(&conn, ".Q.gc[]", out),
+        "info" => do_eval(&conn, INFO_Q, out),
+        "time" => {
+            if arg.is_empty() {
+                Err("usage: q-cli time <conn> <expr>".to_string())
+            } else {
+                do_eval(&conn, &time_q(&arg), out)
+            }
+        }
         other => Err(format!(
-            "unknown mode '{}' (use query|run|ping|tables|meta|count|gc)",
+            "unknown mode '{}' (use query|run|ping|tables|meta|count|gc|info|time)",
             other
         )),
     };
@@ -164,6 +172,18 @@ fn do_web(args: &[String], out: OutMode) -> i32 {
     }
 }
 
+/// Server health snapshot: version, pid, port, open handles, timer, and the
+/// memory triple (used/heap/peak from .Q.w[]), merged into one dict.
+const INFO_Q: &str = "(`version`pid`port`handles`timer!(.z.K;.z.i;first system\"p\";count .z.W;first system\"t\")),`used`heap`peak#.Q.w[]";
+
+/// Wrap an expression so the server times it and returns `ms` + result `count`.
+fn time_q(expr: &str) -> String {
+    format!(
+        "t:.z.p;r:value\"{}\";`ms`count!(`float$(.z.p-t)%1000000;count r)",
+        q_escape(expr)
+    )
+}
+
 fn need_table(t: &str) -> Result<&str, String> {
     if t.is_empty() {
         Err("this command needs a table name".to_string())
@@ -182,6 +202,8 @@ fn print_usage() {
          \x20 q-cli [OUT] tables <conn>\n\
          \x20 q-cli [OUT] meta   <conn> <table>\n\
          \x20 q-cli [OUT] count  <conn> <table>\n\
+         \x20 q-cli [OUT] info   <conn>            (version/pid/port/mem/handles)\n\
+         \x20 q-cli [OUT] time   <conn> \"<q expr>\"  (elapsed ms + result count)\n\
          \x20 q-cli       gc     <conn>            (.Q.gc[] -> bytes freed to OS)\n\
          \x20 q-cli       ping   <conn>\n\
          \x20 q-cli       web    <off|get-ok|status> <conn>\n\
