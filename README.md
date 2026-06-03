@@ -112,3 +112,24 @@ cp target/release/q-cli.exe ~/.local/bin/    # (Windows: Copy-Item ... )
 
 Requires the Rust GNU toolchain on Windows (`stable-x86_64-pc-windows-gnu`) — no
 MSVC build tools needed.
+
+Or install straight from git:
+```sh
+cargo install --git https://github.com/kdevkr/q-cli
+```
+
+## Agent skill (`kdb`)
+
+This repo also ships a Claude / agent **skill** at [`skills/kdb/SKILL.md`](skills/kdb/SKILL.md)
+that teaches an agent how and when to drive `q-cli`. Install it with the
+[`skills`](https://github.com/vercel-labs/skills) CLI:
+
+```sh
+npx skills add kdevkr/q-cli            # interactive: pick agent(s)
+npx skills add kdevkr/q-cli --list     # list skills in this repo
+npx skills add kdevkr/q-cli -y -g      # non-interactive, install globally
+```
+
+It installs `skills/kdb/SKILL.md` into your agent's skills dir (`.claude/skills/`
+or `.agents/skills/`). The skill needs the `q-cli` binary on PATH — install it
+with the `cargo install` line above.
