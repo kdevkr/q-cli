@@ -84,10 +84,23 @@ q-cli       config <init|path|list|add>
    `q-cli info <hp>` is a good first look (version, memory, handles).
 2. **Discover schema before querying** — never assume columns:
    `q-cli tables <hp>`, `q-cli meta <hp> <table>`, `q-cli query <hp> '5#trade'`.
-3. **Aggregate, then explain.** Prefer `select ... by ...` over pulling raw rows;
+3. **Check partitioning FIRST for any historical/HDB table, before writing a
+   query.** Many tables are partitioned (by `date`, or `month`/`year`/`int`):
+   - `q-cli query <hp> '.Q.qp trade'` → `1b` if partitioned.
+   - `q-cli query <hp> '.Q.pf'` → the partition field (`` `date ``/`` `int ``/…).
+   - `q-cli query <hp> '.Q.pv'` → which partitions exist (e.g. dates available).
+   Then **always put the partition column first in the `where` clause** — q only
+   opens the matching directories; without it, it scans the whole DB:
+   ```
+   select vwap:size wavg price by sym from trade
+     where date=2020.06.25, sym=`AAPL        / date (the partition col) constrained FIRST
+   ```
+   For int/hourly-partitioned HDBs constrain on `int` instead of `date`. Background
+   and details: read [references/partitioning.md](references/partitioning.md).
+4. **Aggregate, then explain.** Prefer `select ... by ...` over pulling raw rows;
    read the returned table and tell the user what it shows. Use `--json` if you
    need to post-process numbers; `time` to profile a heavy query first.
-4. **Guard side effects.** `query` runs arbitrary q on the server. Never send
+5. **Guard side effects.** `query` runs arbitrary q on the server. Never send
    `delete`/`update`/`hdel`/`system`/`exit` without explicit user confirmation —
    treat the connection as production unless told otherwise.
 
@@ -114,6 +127,13 @@ Operate via `q-cli`:
 - RDB row counts: `q-cli query localhost:5011 'count each tables[]'`.
 - For end-of-day, confirm the `.u.end` / `.Q.dpft` flow before triggering anything
   that writes/clears partitions.
+
+## Reference resources
+- **[references/partitioning.md](references/partitioning.md)** — partitioned HDBs:
+  the four partition domains (`date`/`month`/`year`/`int`), date vs int/hourly
+  partitioning, the virtual partition column, `.Q.dpft` write-down, `par.txt`
+  segmentation, query patterns, and caveats. Read it whenever the user asks about
+  partitioning, HDB layout, date vs int partitions, write-down, or large histories.
 
 ## Notes
 - A q server started with `-p N` binds IPv4 `0.0.0.0`; `q-cli` already tries both
