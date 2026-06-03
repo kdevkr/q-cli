@@ -52,11 +52,30 @@ fn real_main() -> i32 {
             _ => pos.push(a),
         }
     }
-    if pos.len() < 2 {
+    if pos.is_empty() {
         print_usage();
         return 2;
     }
     let mode = pos[0].as_str();
+
+    // `config` manages the server-profile file; it takes no <conn>.
+    if mode == "config" {
+        return match config::run(&pos[1..]) {
+            Ok(s) => {
+                println!("{}", s);
+                0
+            }
+            Err(e) => {
+                eprintln!("ERR {}", e);
+                2
+            }
+        };
+    }
+
+    if pos.len() < 2 {
+        print_usage();
+        return 2;
+    }
 
     let conn = match config::resolve_conn(&pos[1]) {
         Ok(c) => c,
@@ -111,6 +130,7 @@ fn print_usage() {
          \x20 q-cli [OUT] meta   <conn> <table>\n\
          \x20 q-cli [OUT] count  <conn> <table>\n\
          \x20 q-cli       ping   <conn>\n\
+         \x20 q-cli       config <init|path|list|add>\n\
          \n\
          CONN:\n\
          \x20 host:port[:user:pass]   literal connection\n\

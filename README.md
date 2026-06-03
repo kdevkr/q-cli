@@ -12,9 +12,15 @@ q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
 q-cli       ping   <conn>
+q-cli       config <init|path|list|add>
 ```
 
 ```sh
+# first-time setup — scaffold ~/.config/q-cli/servers.conf, then edit it
+q-cli config init
+q-cli config add prod bigbox:5001:user:pass     # add/update an entry
+q-cli config list                               # show servers (passwords masked)
+
 q-cli ping  localhost:5555
 q-cli query localhost:5555 'select avg price by sym from trade'
 q-cli --json query @prod 'select sym,price from trade'    # array of row objects
