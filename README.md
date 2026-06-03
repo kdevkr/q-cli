@@ -13,6 +13,7 @@ q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
 q-cli       ping   <conn>
+q-cli       web    <off|get-ok|status> <conn>   # tune built-in HTTP serving
 q-cli       config <init|path|list|add>
 ```
 
@@ -46,7 +47,20 @@ prod    = bigbox:5001:user:pass
 - `--console` — the q server formats the result with `.Q.s` (max fidelity).
 
 **Subcommands** — `tables` / `meta <t>` / `count <t>` wrap `tables[]` / `meta t` /
-`count t` for quick schema discovery.
+`count t` for quick schema discovery; `gc` runs `.Q.gc[]`.
+
+**`web` — built-in HTTP serving.** A q process serves IPC *and* HTTP on the same
+port, so a browser to `http://host:port/` gets a default page. Tune it at runtime:
+- `q-cli web off    <conn>` — close every HTTP request (GET + POST).
+- `q-cli web get-ok <conn>` — GET returns `200 OK` (body `OK`); POST/other closed.
+- `q-cli web status <conn>` — show the current `.z.ph` / `.z.pp` handlers.
+
+Runtime-only (resets on restart). To persist, put the same lines in the q startup
+script, e.g. for `get-ok`:
+```q
+.z.ph:{.h.hy[`txt;"OK"]};   / HTTP GET  -> 200 OK
+.z.pp:{hclose .z.w};        / HTTP POST -> closed
+```
 
 - Errors print `ERR ...` on stderr, exit code 1; a q-side error shows as
   `ERR q error '<msg>`.
