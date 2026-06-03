@@ -77,6 +77,11 @@ fn real_main() -> i32 {
         return do_web(&pos[1..], out);
     }
 
+    // `trace` toggles .Q.trp-based backtraces on query errors: <action> <conn>.
+    if mode == "trace" {
+        return do_trace(&pos[1..], out);
+    }
+
     if pos.len() < 2 {
         print_usage();
         return 2;
@@ -184,6 +189,51 @@ fn time_q(expr: &str) -> String {
     )
 }
 
+/// `q-cli trace <on|off|status> <conn>` — wrap the IPC handlers (.z.pg sync,
+/// .z.ps async) with `.Q.trp` so a query error prints a `.Q.sbt` backtrace to
+/// the server console AND re-signals the error (with the trace) to the client.
+/// `off` restores the default `value` handlers. Runtime-only — bake into the q
+/// startup script to persist.
+fn do_trace(args: &[String], out: OutMode) -> i32 {
+    // handler: print backtrace to server stderr, then re-signal msg + backtrace
+    const H: &str = "{.Q.trp[value;x;{-2 .Q.sbt y;'x,\"\\n\",.Q.sbt y}]}";
+    let on = format!(".z.pg:{H};.z.ps:{H};\"trace: on\"");
+    let action = args.first().map(|s| s.as_str()).unwrap_or("");
+    let expr: String = match action {
+        "on" => on,
+        "off" => ".z.pg:value;.z.ps:value;\"trace: off\"".to_string(),
+        "status" => "`pg`ps!(@[{string value x};`.z.pg;\"(default)\"];@[{string value x};`.z.ps;\"(default)\"])".to_string(),
+        _ => {
+            eprintln!("ERR trace action must be: on | off | status");
+            return 2;
+        }
+    };
+    let conn_tok = match args.get(1) {
+        Some(c) => c,
+        None => {
+            eprintln!("ERR usage: q-cli trace <on|off|status> <conn>");
+            return 2;
+        }
+    };
+    let conn = match config::resolve_conn(conn_tok) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERR {}", e);
+            return 2;
+        }
+    };
+    match do_eval(&conn, &expr, out) {
+        Ok(s) => {
+            println!("{}", s);
+            0
+        }
+        Err(e) => {
+            eprintln!("ERR {}", e);
+            1
+        }
+    }
+}
+
 fn need_table(t: &str) -> Result<&str, String> {
     if t.is_empty() {
         Err("this command needs a table name".to_string())
@@ -207,6 +257,7 @@ fn print_usage() {
          \x20 q-cli       gc     <conn>            (.Q.gc[] -> bytes freed to OS)\n\
          \x20 q-cli       ping   <conn>\n\
          \x20 q-cli       web    <off|get-ok|status> <conn>\n\
+         \x20 q-cli       trace  <on|off|status> <conn>   (.Q.trp backtraces)\n\
          \x20 q-cli       config <init|path|list|add>\n\
          \n\
          CONN:\n\

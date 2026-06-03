@@ -16,6 +16,7 @@ q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
 q-cli       ping   <conn>
 q-cli       web    <off|get-ok|status> <conn>   # tune built-in HTTP serving
+q-cli       trace  <on|off|status> <conn>       # .Q.trp backtraces on errors
 q-cli       config <init|path|list|add>
 ```
 
@@ -65,6 +66,21 @@ script, e.g. for `get-ok`:
 ```q
 .z.ph:{.h.hy[`txt;"OK"]};   / HTTP GET  -> 200 OK
 .z.pp:{hclose .z.w};        / HTTP POST -> closed
+```
+
+**`trace` — backtraces on query errors.** By default a failing query returns just
+`'type`; `q-cli trace on <conn>` wraps the IPC handlers with `.Q.trp` so errors
+come back with a `.Q.sbt` call-stack (and also print it to the server console):
+```
+ERR q error 'type
+  [3]  {x+`a}
+         ^
+  [2]  {x+`a}[1]
+```
+`trace off` restores the default handlers; `trace status` shows them. Runtime-only;
+the equivalent startup line is:
+```q
+.z.pg:.z.ps:{.Q.trp[value;x;{-2 .Q.sbt y;'x,"\n",.Q.sbt y}]};
 ```
 
 - Errors print `ERR ...` on stderr, exit code 1; a q-side error shows as
