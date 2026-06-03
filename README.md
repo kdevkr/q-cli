@@ -11,6 +11,7 @@ q-cli [OUT] run    <conn> <path.q>
 q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
+q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
 q-cli       ping   <conn>
 q-cli       config <init|path|list|add>
 ```

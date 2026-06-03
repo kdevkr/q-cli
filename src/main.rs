@@ -96,7 +96,11 @@ fn real_main() -> i32 {
         "tables" => do_eval(&conn, "tables[]", out),
         "meta" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("meta {}", t), out)),
         "count" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("count {}", t), out)),
-        other => Err(format!("unknown mode '{}' (use query|run|ping|tables|meta|count)", other)),
+        "gc" => do_eval(&conn, ".Q.gc[]", out),
+        other => Err(format!(
+            "unknown mode '{}' (use query|run|ping|tables|meta|count|gc)",
+            other
+        )),
     };
 
     match result {
@@ -129,6 +133,7 @@ fn print_usage() {
          \x20 q-cli [OUT] tables <conn>\n\
          \x20 q-cli [OUT] meta   <conn> <table>\n\
          \x20 q-cli [OUT] count  <conn> <table>\n\
+         \x20 q-cli       gc     <conn>            (.Q.gc[] -> bytes freed to OS)\n\
          \x20 q-cli       ping   <conn>\n\
          \x20 q-cli       config <init|path|list|add>\n\
          \n\
