@@ -11,6 +11,7 @@ q-cli [OUT] run    <conn> <path.q>
 q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
+q-cli [OUT] describe <conn> <table>  # partitioning + schema + rows + sample (1 call)
 q-cli [OUT] info   <conn>            # version, pid, port, memory, handles
 q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
@@ -43,17 +44,29 @@ local   = localhost:5555
 prod    = bigbox:5001:user:pass
 ```
 
-**Output modes** (default: aligned text):
+**Output modes & flags** (default: aligned text):
 - `--json` / `-j` — JSON. Tables → array of row objects; keyed tables merge
-  key+value columns; temporal types → formatted strings. Text/JSON cap at 50 rows.
+  key+value columns; temporal types → formatted strings.
 - `--csv` — CSV (tables only, RFC4180-escaped, **uncapped**).
 - `--console` — the q server formats the result with `.Q.s` (max fidelity).
+- `--max-rows N` — row cap for text/json (default 50; `0` = unlimited). When a
+  table is capped, a `note: showing N of M rows` is printed to **stderr** so it's
+  machine-detectable; stdout stays pure data.
+- `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
+  (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
+  `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`, **not a
+  sandbox** — guards an agent from accidentally mutating data.
 
-**Subcommands** — `tables` / `meta <t>` / `count <t>` wrap `tables[]` / `meta t` /
-`count t` for quick schema discovery; `gc` runs `.Q.gc[]`. `info` returns a
-health snapshot (version/pid/port/used/heap/peak/handles/timer). `time <expr>`
-times the expression on the server and returns `ms` + result `count` (not the
-data) — e.g. `q-cli time @ 'select avg price by sym from trade'`.
+**Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
+unknown server, readonly block) · `3` connection (refused/timeout/handshake) ·
+`4` q error (server returned `'…`). With `--json`, errors print as
+`{"error":"…","kind":"usage|connect|query"}` on stderr.
+
+**Subcommands** — `tables` / `meta <t>` / `count <t>` for quick schema discovery;
+`describe <t>` returns partitioning + columns + row count + a small sample in
+**one** call (JSON-friendly); `gc` runs `.Q.gc[]`; `info` is a health snapshot
+(version/pid/port/used/heap/peak/handles/timer); `time <expr>` returns `ms` +
+result `count` (not the data) — e.g. `q-cli time @ 'select avg price by sym from trade'`.
 
 **`web` — built-in HTTP serving.** A q process serves IPC *and* HTTP on the same
 port, so a browser to `http://host:port/` gets a default page. Tune it at runtime:

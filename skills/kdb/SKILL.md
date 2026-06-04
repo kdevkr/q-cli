@@ -21,11 +21,12 @@ Use the **Bash** tool. `q-cli` is on PATH:
 ```
 q-cli [OUT] query  <conn> "<q expression>"
 q-cli [OUT] run    <conn> <path.q>
-q-cli [OUT] tables <conn>
-q-cli [OUT] meta   <conn> <table>
-q-cli [OUT] count  <conn> <table>
-q-cli [OUT] info   <conn>
-q-cli [OUT] time   <conn> "<q expr>"
+q-cli [OUT] tables   <conn>
+q-cli [OUT] meta     <conn> <table>
+q-cli [OUT] count    <conn> <table>
+q-cli [OUT] describe <conn> <table>
+q-cli [OUT] info     <conn>
+q-cli [OUT] time     <conn> "<q expr>"
 q-cli       gc     <conn>
 q-cli       ping   <conn>
 q-cli       web    <off|get-ok|status> <conn>
@@ -38,6 +39,10 @@ q-cli       config <init|path|list|add>
   (single expression / `;`-separated; multi-statement scripts: load on server).
 - **`ping`** → `pong` if the handshake succeeds.
 - **`tables`** / **`meta <t>`** / **`count <t>`** → fast schema discovery.
+- **`describe <t>`** → partitioning (`.Q.qp`/`.Q.pf`) + columns/types (`meta`) + row
+  count + a small sample, in **one** call (JSON-friendly). Prefer this as the first
+  look at an unknown table — it surfaces the partition column so you know what to
+  constrain first.
 - **`info`** → server health snapshot (version, pid, port, used/heap/peak memory,
   open handles, timer) as a dict.
 - **`time <expr>`** → time the expression on the server; returns `ms` + result
@@ -66,6 +71,15 @@ q-cli       config <init|path|list|add>
 - `--csv` → CSV (tables only, **uncapped** — for export/piping).
 - `--console` → let the **q server** format via `.Q.s` (max fidelity for exotic /
   deeply-nested types).
+- `--max-rows N` → cap text/json at N rows (default 50; `0` = unlimited). On a cap,
+  a `note: showing N of M rows` goes to **stderr** (stdout stays pure data) — use a
+  small N to save context, `0` when you need every row.
+- `--readonly` (or `Q_CLI_READONLY=1`) → refuse mutating q (`delete`/`update`/`set`/
+  `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`. Heuristic, not a sandbox.
+
+**Exit codes** — branch on these instead of parsing text: `0` ok · `2` usage/policy
+(bad args, unknown server, readonly block) · `3` connection (retry/ping) · `4` q
+error (fix the query). With `--json`, errors are `{"error","kind"}` on stderr.
 
 **Gotchas**
 - Failures print `ERR ...` on stderr, non-zero exit (connection refused, bad query
@@ -82,8 +96,9 @@ q-cli       config <init|path|list|add>
 
 1. **Confirm host:port** (ask if unknown), then `q-cli ping <hp>` to verify.
    `q-cli info <hp>` is a good first look (version, memory, handles).
-2. **Discover schema before querying** — never assume columns:
-   `q-cli tables <hp>`, `q-cli meta <hp> <table>`, `q-cli query <hp> '5#trade'`.
+2. **Discover schema before querying** — never assume columns. The fastest path is
+   `q-cli describe <hp> <table>`, which returns partitioning + columns/types + row
+   count + a sample in one call; otherwise `q-cli tables`/`meta`/`count`.
 3. **Check partitioning FIRST for any historical/HDB table, before writing a
    query.** Many tables are partitioned (by `date`, or `month`/`year`/`int`):
    - `q-cli query <hp> '.Q.qp trade'` → `1b` if partitioned.

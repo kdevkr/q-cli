@@ -1,4 +1,5 @@
 //! Render a deserialized `K` value as readable text or as JSON.
+//! Row caps take a `max` argument; `max == 0` means unlimited.
 
 use crate::k::*;
 
@@ -38,6 +39,9 @@ pub fn scalar_to_string(k: &K) -> String {
         K::Time(v) => fmt_time(*v),
         K::Guid(g) => fmt_guid(g),
         K::Null => String::new(),
+        // nested table/dict in a scalar slot -> compact summary (no recursion)
+        K::Table(_) => format!("(table: {} rows)", table_rows(k).unwrap_or(0)),
+        K::Dict(_, _) => "(dict)".into(),
         other => compact_vec(other),
     }
 }
@@ -93,18 +97,25 @@ fn table_parts(k: &K) -> Option<(Vec<String>, Vec<K>)> {
     }
 }
 
-const ROW_CAP: usize = 50;
+/// Row count if `k` is a table or keyed table (used for truncation signalling).
+pub fn table_rows(k: &K) -> Option<usize> {
+    table_parts(k).map(|(_, cols)| cols.first().map(len_of).unwrap_or(0))
+}
+
+fn cap(nrows: usize, max: usize) -> usize {
+    if max == 0 { nrows } else { nrows.min(max) }
+}
 
 // ============================================================================
 // Text rendering
 // ============================================================================
 
-pub fn to_text(k: &K) -> String {
+pub fn to_text(k: &K, max: usize) -> String {
     if let Some((names, cols)) = table_parts(k) {
-        return render_table(&names, &cols);
+        return render_table(&names, &cols, max);
     }
     match k {
-        K::Dict(keys, vals) => render_dict(keys, vals),
+        K::Dict(keys, vals) => render_dict(keys, vals, max),
         K::CharV(s) => s.clone(),
         K::List(v) => v
             .iter()
@@ -113,7 +124,6 @@ pub fn to_text(k: &K) -> String {
             .join("\n"),
         K::Null => "::".into(),
         atom_or_vec => {
-            // vectors -> compact line; atoms -> their scalar form
             if len_of(atom_or_vec) > 1 {
                 compact_vec(atom_or_vec)
             } else {
@@ -123,11 +133,10 @@ pub fn to_text(k: &K) -> String {
     }
 }
 
-fn render_table(names: &[String], cols: &[K]) -> String {
+fn render_table(names: &[String], cols: &[K], max: usize) -> String {
     let nrows = cols.first().map(len_of).unwrap_or(0);
-    let shown = nrows.min(ROW_CAP);
+    let shown = cap(nrows, max);
 
-    // build cell strings column-by-column
     let mut widths: Vec<usize> = names.iter().map(|n| n.len()).collect();
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(cols.len());
     for (ci, col) in cols.iter().enumerate() {
@@ -141,7 +150,6 @@ fn render_table(names: &[String], cols: &[K]) -> String {
     }
 
     let mut out = String::new();
-    // header
     for (ci, name) in names.iter().enumerate() {
         if ci > 0 {
             out.push(' ');
@@ -149,11 +157,9 @@ fn render_table(names: &[String], cols: &[K]) -> String {
         out.push_str(&pad(name, widths[ci]));
     }
     out.push('\n');
-    // separator
     let total: usize = widths.iter().sum::<usize>() + names.len().saturating_sub(1);
     out.push_str(&"-".repeat(total));
     out.push('\n');
-    // rows
     for i in 0..shown {
         for ci in 0..cols.len() {
             if ci > 0 {
@@ -177,31 +183,38 @@ fn pad(s: &str, w: usize) -> String {
     }
 }
 
-fn render_dict(keys: &K, vals: &K) -> String {
+/// Dict as `key| value` lines; a table-valued entry is rendered as an indented
+/// sub-table block (so e.g. `describe`'s columns/sample show in full).
+fn render_dict(keys: &K, vals: &K, max: usize) -> String {
     let n = len_of(keys);
-    let mut rows: Vec<(String, String)> = Vec::with_capacity(n);
-    let mut kw = 0;
+    let kw = (0..n)
+        .map(|i| scalar_to_string(&at(keys, i)).len())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<String> = Vec::new();
     for i in 0..n {
-        let ks = scalar_to_string(&at(keys, i));
-        let vs = scalar_to_string(&at(vals, i));
-        kw = kw.max(ks.len());
-        rows.push((ks, vs));
+        let kstr = scalar_to_string(&at(keys, i));
+        let v = at(vals, i);
+        if table_parts(&v).is_some() {
+            lines.push(format!("{}|", kstr));
+            for l in to_text(&v, max).lines() {
+                lines.push(format!("  {}", l));
+            }
+        } else {
+            lines.push(format!("{}| {}", pad(&kstr, kw), scalar_to_string(&v)));
+        }
     }
-    rows.iter()
-        .map(|(kk, vv)| format!("{}| {}", pad(kk, kw), vv))
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.join("\n")
 }
 
 // ============================================================================
-// CSV rendering (tables only; non-tables fall back to text). Uncapped — CSV is
-// meant for export/piping, so we emit every row.
+// CSV rendering (tables only; non-tables fall back to text). Uncapped.
 // ============================================================================
 
 pub fn to_csv(k: &K) -> String {
     let (names, cols) = match table_parts(k) {
         Some(p) => p,
-        None => return to_text(k),
+        None => return to_text(k, 0),
     };
     let nrows = cols.first().map(len_of).unwrap_or(0);
     let mut out = String::new();
@@ -236,16 +249,15 @@ fn csv_field(s: &str) -> String {
 // JSON rendering
 // ============================================================================
 
-pub fn to_json(k: &K) -> String {
-    // tables (and keyed tables) -> array of row objects
+pub fn to_json(k: &K, max: usize) -> String {
     if let Some((names, cols)) = table_parts(k) {
-        return json_rows(&names, &cols);
+        return json_rows(&names, &cols, max);
     }
     json_frag(k)
 }
 
-fn json_rows(names: &[String], cols: &[K]) -> String {
-    let nrows = cols.first().map(len_of).unwrap_or(0);
+fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
+    let nrows = cap(cols.first().map(len_of).unwrap_or(0), max);
     let mut out = String::from("[");
     for i in 0..nrows {
         if i > 0 {
@@ -298,13 +310,12 @@ fn json_frag(k: &K) -> String {
         K::Dict(keys, vals) => json_dict(keys, vals),
         K::Table(_) => {
             if let Some((names, cols)) = table_parts(k) {
-                json_rows(&names, &cols)
+                json_rows(&names, &cols, 0)
             } else {
                 "null".into()
             }
         }
         K::Null => "null".into(),
-        // remaining typed vectors -> array of element fragments
         other => {
             let n = len_of(other);
             let items: Vec<String> = (0..n).map(|i| json_frag(&at(other, i))).collect();
@@ -314,7 +325,6 @@ fn json_frag(k: &K) -> String {
 }
 
 fn json_dict(keys: &K, vals: &K) -> String {
-    // keyed table handled by to_json/json_frag(Table); here: plain dict
     if let K::SymbolV(names) = keys {
         let n = names.len();
         let mut out = String::from("{");
@@ -329,11 +339,10 @@ fn json_dict(keys: &K, vals: &K) -> String {
         out.push('}');
         out
     } else if is_table(keys) && is_table(vals) {
-        if let Some((names, cols)) = table_parts(&K::Dict(
-            Box::new(keys.clone()),
-            Box::new(vals.clone()),
-        )) {
-            return json_rows(&names, &cols);
+        if let Some((names, cols)) =
+            table_parts(&K::Dict(Box::new(keys.clone()), Box::new(vals.clone())))
+        {
+            return json_rows(&names, &cols, 0);
         }
         "null".into()
     } else {
@@ -361,7 +370,8 @@ fn float_json(v: f64) -> String {
     }
 }
 
-fn json_string(s: &str) -> String {
+/// JSON-escape a string (public so error output can reuse it).
+pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
