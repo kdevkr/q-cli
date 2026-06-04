@@ -309,10 +309,12 @@ fn print_usage() {
          \x20 q-cli       ping     <conn>\n\
          \x20 q-cli       web      <off|get-ok|status> <conn>\n\
          \x20 q-cli       trace    <on|off|status> <conn>\n\
-         \x20 q-cli       config   <init|path|list|add>\n\
+         \x20 q-cli       config   <init|path|list|add> [--project]\n\
          \n\
          CONN: host:port[:user:pass] | @name | name | @ (default)\n\
-         \x20 config: $Q_CLI_CONFIG or ~/.config/q-cli/servers.conf\n\
+         \x20 config (merged, project overrides global):\n\
+         \x20   global  $Q_CLI_CONFIG or ~/.config/q-cli/servers.conf\n\
+         \x20   project nearest .q-cli.conf up from CWD  (config --project writes ./.q-cli.conf)\n\
          \n\
          OUT (default: aligned text, 50-row cap):\n\
          \x20 --json, -j      JSON (tables -> array of row objects)\n\

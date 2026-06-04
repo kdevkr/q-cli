@@ -60,11 +60,13 @@ q-cli       config <init|path|list|add>
 **`<conn>`** — `host:port[:user:pass]` literal, OR a config name:
 - `@name` / `name` → look up `servers.{name}` in the config file.
 - `@` / `default` → the configured default server.
-- Config: `$Q_CLI_CONFIG` or `~/.config/q-cli/servers.conf`, lines
-  `name = host:port[:user:pass]`, plus `default = <name>`.
-- First-time setup: `q-cli config init` scaffolds the file (won't overwrite);
-  `q-cli config add <name> <conn>` adds an entry; `q-cli config list` shows them
-  (passwords masked); `q-cli config path` prints the location.
+- Config is two layers, **project overriding global**: global (`$Q_CLI_CONFIG` or
+  `~/.config/q-cli/servers.conf`) plus the nearest `.q-cli.conf` walking up from the
+  CWD. Lines `name = host:port[:user:pass]`, plus `default = <name>`.
+- First-time setup: `q-cli config init` scaffolds the global file (add `--project`
+  for `./.q-cli.conf`); `q-cli config add [--project] <name> <conn>` adds an entry;
+  `q-cli config list` shows the merged set tagged `[global]`/`[project]`;
+  `q-cli config path` shows both layers.
 
 **`[OUT]`** output mode (default: aligned text, capped at 50 rows):
 - `--json` → JSON; tables → **array of row objects**, keyed tables merge key+value.

@@ -1,26 +1,35 @@
 //! Named-server config: resolution + the `q-cli config` subcommands.
 //!
-//! Config file (`$Q_CLI_CONFIG`, else `~/.config/q-cli/servers.conf`) is a
-//! simple `name = value` list; `#` starts a comment. Example:
+//! Two layers, merged with **project overriding global**:
+//!   - global:  `$Q_CLI_CONFIG`, else `~/.config/q-cli/servers.conf`
+//!   - project: the nearest `.q-cli.conf` found walking up from the CWD
 //!
+//! If `$Q_CLI_CONFIG` is set it is used **alone** (explicit override, no merge).
+//!
+//! File format — `name = value` lines, `#` comments. `value` is
+//! `host:port[:user:pass]`; `default` may name another entry. Example:
 //! ```text
 //! default = local
 //! local   = localhost:5555
 //! prod    = bigbox:5001:user:pass
-//! tp      = localhost:5010
 //! ```
-//!
-//! A connection token resolves as:
-//!   - contains `:`            -> used literally (host:port[:user:pass])
-//!   - `@name` / `name`        -> looked up in the config
-//!   - `@` / `default` / empty -> the `default` entry (which may point at a name)
+//! Connection token resolution:
+//!   - contains `:`            -> literal host:port[:user:pass]
+//!   - `@name` / `name`        -> looked up in the merged config
+//!   - `@` / `default` / empty -> the `default` entry
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Resolved path of the config file.
-pub fn path() -> PathBuf {
+const PROJECT_FILE: &str = ".q-cli.conf";
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/// The global config path (`$Q_CLI_CONFIG` or `~/.config/q-cli/servers.conf`).
+pub fn global_path() -> PathBuf {
     if let Ok(p) = std::env::var("Q_CLI_CONFIG") {
         return PathBuf::from(p);
     }
@@ -34,10 +43,32 @@ pub fn path() -> PathBuf {
     p
 }
 
-fn load() -> Result<HashMap<String, String>, String> {
-    let p = path();
-    let text = fs::read_to_string(&p)
-        .map_err(|_| format!("no config at {} (run `q-cli config init`)", p.display()))?;
+/// Nearest existing `.q-cli.conf` walking up from the current directory.
+fn project_path_read() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let cand = dir.join(PROJECT_FILE);
+        if cand.is_file() {
+            return Some(cand);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Where `config --project` writes: `./.q-cli.conf` in the current directory.
+fn project_path_write() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(PROJECT_FILE)
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+fn parse(text: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -51,26 +82,51 @@ fn load() -> Result<HashMap<String, String>, String> {
             }
         }
     }
+    map
+}
+
+fn load_file(p: &Path) -> Result<HashMap<String, String>, String> {
+    let text = fs::read_to_string(p).map_err(|_| format!("cannot read {}", p.display()))?;
+    Ok(parse(&text))
+}
+
+/// Effective config: global, then project overlaid on top. With `$Q_CLI_CONFIG`
+/// set, that single file is used alone.
+fn load_merged() -> Result<HashMap<String, String>, String> {
+    if std::env::var("Q_CLI_CONFIG").is_ok() {
+        return load_file(&global_path());
+    }
+    let mut map = HashMap::new();
+    if let Ok(g) = load_file(&global_path()) {
+        map.extend(g);
+    }
+    if let Some(pp) = project_path_read() {
+        if let Ok(p) = load_file(&pp) {
+            map.extend(p); // project overrides global
+        }
+    }
+    if map.is_empty() {
+        return Err(format!(
+            "no servers configured (global {} or a project {}); run `q-cli config init`",
+            global_path().display(),
+            PROJECT_FILE
+        ));
+    }
     Ok(map)
 }
 
 pub fn resolve_conn(token: &str) -> Result<String, String> {
     let name = token.strip_prefix('@').unwrap_or(token);
-
-    // a literal connection string always contains a colon
     if name.contains(':') {
         return Ok(name.to_string());
     }
-
     let key = if name.is_empty() { "default" } else { name };
-    let servers = load()?;
+    let servers = load_merged()?;
 
     let mut val = servers
         .get(key)
         .cloned()
-        .ok_or_else(|| format!("unknown server '{}' in {}", key, path().display()))?;
-
-    // a `default` (or any entry) that names another server resolves once more
+        .ok_or_else(|| format!("unknown server '{}' (not in global/project config)", key))?;
     if !val.contains(':') {
         val = servers
             .get(&val)
@@ -81,7 +137,7 @@ pub fn resolve_conn(token: &str) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// `q-cli config <action>`
+// `q-cli config <action> [--project]`
 // ---------------------------------------------------------------------------
 
 const TEMPLATE: &str = "# q-cli server profiles\n\
@@ -92,67 +148,121 @@ default = local\n\
 local   = localhost:5000\n";
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let action = args.first().map(|s| s.as_str()).unwrap_or("path");
+    let project = args.iter().any(|a| a == "--project" || a == "-p");
+    let rest: Vec<&str> = args
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|a| *a != "--project" && *a != "-p")
+        .collect();
+    let action = rest.first().copied().unwrap_or("path");
+    let target = if project {
+        project_path_write()
+    } else {
+        global_path()
+    };
+
     match action {
-        "init" => init(),
-        "path" => Ok(path().display().to_string()),
+        "init" => init(&target),
+        "path" => Ok(path_summary()),
         "list" => list(),
         "add" => {
-            let name = args
+            let name = rest
                 .get(1)
-                .ok_or("usage: q-cli config add <name> <host:port[:user:pass]>")?;
-            let conn = args
+                .ok_or("usage: q-cli config add [--project] <name> <host:port[:user:pass]>")?;
+            let conn = rest
                 .get(2)
-                .ok_or("usage: q-cli config add <name> <host:port[:user:pass]>")?;
-            add(name, conn)
+                .ok_or("usage: q-cli config add [--project] <name> <host:port[:user:pass]>")?;
+            add(&target, name, conn)
         }
         other => Err(format!(
-            "unknown config action '{}' (use init | path | list | add)",
+            "unknown config action '{}' (init | path | list | add) [--project]",
             other
         )),
     }
 }
 
-fn init() -> Result<String, String> {
-    let p = path();
-    if p.exists() {
+fn init(target: &Path) -> Result<String, String> {
+    if target.exists() {
         return Ok(format!(
-            "config already exists: {}\n(edit it, or `q-cli config add <name> <conn>`)",
-            p.display()
+            "config already exists: {}\n(edit it, or `q-cli config add [--project] <name> <conn>`)",
+            target.display()
         ));
     }
-    if let Some(dir) = p.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+    if let Some(dir) = target.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+        }
     }
-    fs::write(&p, TEMPLATE).map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+    fs::write(target, TEMPLATE).map_err(|e| format!("cannot write {}: {}", target.display(), e))?;
     Ok(format!(
-        "created {}\nedit it so `default` -> `local` points at your q process,\nthen: q-cli tables @",
-        p.display()
+        "created {}\nedit it so `default` points at your q process, then: q-cli tables @",
+        target.display()
     ))
 }
 
-fn list() -> Result<String, String> {
-    let map = load()?;
-    if map.is_empty() {
-        return Ok(format!("(no servers defined in {})", path().display()));
+fn path_summary() -> String {
+    let g = global_path();
+    let mut s = format!(
+        "global:  {}   ({})",
+        g.display(),
+        if g.exists() { "exists" } else { "none" }
+    );
+    match project_path_read() {
+        Some(p) => s.push_str(&format!("\nproject: {}   (active)", p.display())),
+        None => s.push_str(&format!(
+            "\nproject: {}   (none here)",
+            project_path_write().display()
+        )),
     }
-    let mut lines: Vec<String> = map
-        .iter()
-        .map(|(k, v)| format!("{} = {}", k, mask(v)))
-        .collect();
-    lines.sort();
-    Ok(lines.join("\n"))
+    if let Ok(e) = std::env::var("Q_CLI_CONFIG") {
+        s.push_str(&format!("\nenv Q_CLI_CONFIG: {}   (used alone)", e));
+    }
+    s
 }
 
-/// Add or update one entry, preserving existing lines and comments.
-fn add(name: &str, conn: &str) -> Result<String, String> {
-    let p = path();
-    if let Some(dir) = p.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+/// Effective servers, annotated with their source (project overrides global).
+fn list() -> Result<String, String> {
+    let mut rows: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
+    if std::env::var("Q_CLI_CONFIG").is_ok() {
+        if let Ok(m) = load_file(&global_path()) {
+            for (k, v) in m {
+                rows.insert(k, (v, "env"));
+            }
+        }
+    } else {
+        if let Ok(g) = load_file(&global_path()) {
+            for (k, v) in g {
+                rows.insert(k, (v, "global"));
+            }
+        }
+        if let Some(pp) = project_path_read() {
+            if let Ok(p) = load_file(&pp) {
+                for (k, v) in p {
+                    rows.insert(k, (v, "project"));
+                }
+            }
+        }
     }
-    let mut lines: Vec<String> = if p.exists() {
-        fs::read_to_string(&p)
-            .map_err(|e| format!("cannot read {}: {}", p.display(), e))?
+    if rows.is_empty() {
+        return Ok("(no servers configured)".to_string());
+    }
+    Ok(rows
+        .iter()
+        .map(|(k, (v, src))| format!("{} = {}   [{}]", k, mask(v), src))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Add or update one entry in `target`, preserving existing lines and comments.
+fn add(target: &Path, name: &str, conn: &str) -> Result<String, String> {
+    if let Some(dir) = target.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+        }
+    }
+    let mut lines: Vec<String> = if target.exists() {
+        fs::read_to_string(target)
+            .map_err(|e| format!("cannot read {}: {}", target.display(), e))?
             .lines()
             .map(|s| s.to_string())
             .collect()
@@ -180,13 +290,13 @@ fn add(name: &str, conn: &str) -> Result<String, String> {
 
     let mut body = lines.join("\n");
     body.push('\n');
-    fs::write(&p, body).map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+    fs::write(target, body).map_err(|e| format!("cannot write {}: {}", target.display(), e))?;
     Ok(format!(
         "{} {} = {}  ({})",
         if replaced { "updated" } else { "added" },
         name,
         mask(conn),
-        p.display()
+        target.display()
     ))
 }
 

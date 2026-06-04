@@ -37,11 +37,22 @@ q-cli meta  @ trade     # column schema
 ```
 
 **`<conn>`** — `host:port[:user:pass]`, or a config name (`@name` / `name` /
-`@`=default). Config: `$Q_CLI_CONFIG` or `~/.config/q-cli/servers.conf`:
+`@`=default). Config is **two layers, project overriding global**:
 ```text
+# global:  $Q_CLI_CONFIG, else ~/.config/q-cli/servers.conf
+# project: nearest .q-cli.conf walking up from the current directory
 default = local
 local   = localhost:5555
 prod    = bigbox:5001:user:pass
+```
+A per-project `.q-cli.conf` (e.g. checked into a repo) overlays the global one —
+same-named entries (including `default`) win. `$Q_CLI_CONFIG`, if set, is used
+alone. Manage either layer:
+```sh
+q-cli config init --project          # scaffold ./.q-cli.conf
+q-cli config add  --project dev localhost:6000
+q-cli config list                    # merged view, each entry tagged [global]/[project]
+q-cli config path                    # show both layers and which project file is active
 ```
 
 **Output modes & flags** (default: aligned text):
