@@ -12,6 +12,8 @@ q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
 q-cli [OUT] describe <conn> <table>  # partitioning + schema + rows + sample (1 call)
+q-cli [OUT] schema <conn>            # all tables: rows/cols/partition (1 call)
+q-cli [OUT] functions <conn> [ns]    # defined functions + arity (root or .ns)
 q-cli [OUT] info   <conn>            # version, pid, port, memory, handles
 q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
@@ -63,21 +65,32 @@ q-cli config path                    # show both layers and which project file i
 - `--max-rows N` — row cap for text/json (default 50; `0` = unlimited). When a
   table is capped, a `note: showing N of M rows` is printed to **stderr** so it's
   machine-detectable; stdout stays pure data.
+- `--timeout MS` (or `Q_CLI_TIMEOUT`) — how long to wait for a query result, in
+  milliseconds (default `30000`). Also caps the connect at `min(MS, 5000)`. A
+  read/connect that exceeds it fails with `kind:"timeout"` and **exit 5** — so an
+  agent can tell "the query never came back" (retry / raise the limit) apart from
+  "connection refused" (exit 3). A heavy `select` should set a generous value.
 - `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
   (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
   `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`, **not a
   sandbox** — guards an agent from accidentally mutating data.
 
 **Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
-unknown server, readonly block) · `3` connection (refused/timeout/handshake) ·
-`4` q error (server returned `'…`). With `--json`, errors print as
-`{"error":"…","kind":"usage|connect|query"}` on stderr.
+unknown server, readonly block) · `3` connection (refused/unreachable/auth) ·
+`4` q error (server returned `'…`) · `5` timeout (query/connect exceeded
+`--timeout`). With `--json`, errors print as
+`{"error":"…","kind":"usage|connect|query|timeout"}` on stderr.
 
 **Subcommands** — `tables` / `meta <t>` / `count <t>` for quick schema discovery;
-`describe <t>` returns partitioning + columns + row count + a small sample in
-**one** call (JSON-friendly); `gc` runs `.Q.gc[]`; `info` is a health snapshot
-(version/pid/port/used/heap/peak/handles/timer); `time <expr>` returns `ms` +
-result `count` (not the data) — e.g. `q-cli time @ 'select avg price by sym from trade'`.
+`describe <t>` returns partitioning + columns + row count + a small sample for one
+table in **one** call (JSON-friendly); `schema` does the whole DB in one call —
+every table with its row count, column count, and partition field (a fast first
+map of an unknown process); `functions [ns]` lists the functions defined in a
+namespace (root by default, or `.u`, `.Q`, …) with each one's arity, so you can
+reuse server-side helpers instead of reinventing them; `gc` runs `.Q.gc[]`; `info`
+is a health snapshot (version/pid/port/used/heap/peak/handles/timer); `time <expr>`
+returns `ms` + result `count` (not the data) — e.g.
+`q-cli time @ 'select avg price by sym from trade'`.
 
 **`web` — built-in HTTP serving.** A q process serves IPC *and* HTTP on the same
 port, so a browser to `http://host:port/` gets a default page. Tune it at runtime:
@@ -107,8 +120,8 @@ the equivalent startup line is:
 .z.pg:.z.ps:{.Q.trp[value;x;{-2 .Q.sbt y;'x,"\n",.Q.sbt y}]};
 ```
 
-- Errors print `ERR ...` on stderr, exit code 1; a q-side error shows as
-  `ERR q error '<msg>`.
+- Errors print `ERR ...` on stderr with a non-zero exit (see exit codes above); a
+  q-side error shows as `ERR q error '<msg>`.
 - `localhost` tries both `::1` and `127.0.0.1` (a q server `-p N` binds IPv4 only).
 
 ## How it works

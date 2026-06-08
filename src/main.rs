@@ -24,6 +24,7 @@ enum Kind {
     Usage,
     Connect,
     Query,
+    Timeout,
 }
 
 impl Kind {
@@ -32,6 +33,7 @@ impl Kind {
             Kind::Usage => 2,
             Kind::Connect => 3,
             Kind::Query => 4,
+            Kind::Timeout => 5,
         }
     }
     fn name(self) -> &'static str {
@@ -39,6 +41,7 @@ impl Kind {
             Kind::Usage => "usage",
             Kind::Connect => "connect",
             Kind::Query => "query",
+            Kind::Timeout => "timeout",
         }
     }
 }
@@ -58,6 +61,22 @@ impl E {
     fn query<S: Into<String>>(m: S) -> E {
         E { kind: Kind::Query, msg: m.into() }
     }
+    fn timeout<S: Into<String>>(m: S) -> E {
+        E { kind: Kind::Timeout, msg: m.into() }
+    }
+}
+
+/// Classify an I/O error: a socket read/connect timeout becomes `Kind::Timeout`
+/// (exit 5) so agents can tell "query never came back" apart from "refused"
+/// (`Kind::Connect`, exit 3). Windows surfaces a read timeout as `TimedOut`,
+/// most Unixes as `WouldBlock`; treat both as a timeout.
+fn io_err(prefix: &str, e: &std::io::Error) -> E {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    if matches!(e.kind(), TimedOut | WouldBlock) {
+        E::timeout(format!("{}: timed out (raise --timeout to wait longer)", prefix))
+    } else {
+        E::connect(format!("{}: {}", prefix, e))
+    }
 }
 
 type R = Result<String, E>;
@@ -74,6 +93,7 @@ struct Opts {
     out: OutMode,
     max_rows: usize, // 0 = unlimited
     readonly: bool,
+    timeout: Duration, // governs the query wait (and caps connect)
 }
 
 fn main() {
@@ -86,6 +106,11 @@ fn real_main() -> i32 {
     let mut readonly = std::env::var("Q_CLI_READONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // default query wait: 30s, overridable per-call (--timeout) or via env.
+    let mut timeout_ms: u64 = std::env::var("Q_CLI_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut pos: Vec<String> = Vec::new();
@@ -101,6 +126,10 @@ fn real_main() -> i32 {
                 i += 1;
                 max_rows = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(max_rows);
             }
+            "--timeout" => {
+                i += 1;
+                timeout_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(timeout_ms);
+            }
             "-h" | "--help" => {
                 print_usage();
                 return 0;
@@ -108,11 +137,14 @@ fn real_main() -> i32 {
             s if s.starts_with("--max-rows=") => {
                 max_rows = s[11..].parse().unwrap_or(max_rows);
             }
+            s if s.starts_with("--timeout=") => {
+                timeout_ms = s[10..].parse().unwrap_or(timeout_ms);
+            }
             _ => pos.push(args[i].clone()),
         }
         i += 1;
     }
-    let opts = Opts { out, max_rows, readonly };
+    let opts = Opts { out, max_rows, readonly, timeout: Duration::from_millis(timeout_ms.max(1)) };
 
     if pos.is_empty() {
         print_usage();
@@ -144,7 +176,7 @@ fn real_main() -> i32 {
     let arg = pos.get(2).cloned().unwrap_or_default();
 
     let result: R = match mode {
-        "ping" => do_ping(&conn),
+        "ping" => do_ping(&conn, &opts),
         "query" => ro(&arg, &opts).and_then(|_| do_eval(&conn, &arg, &opts)),
         "run" => match std::fs::read_to_string(&arg) {
             Ok(src) => ro(&src, &opts).and_then(|_| do_eval(&conn, &src, &opts)),
@@ -154,6 +186,8 @@ fn real_main() -> i32 {
         "meta" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("meta {}", t), &opts)),
         "count" => need_table(&arg).and_then(|t| do_eval(&conn, &format!("count {}", t), &opts)),
         "describe" => need_table(&arg).and_then(|t| do_eval(&conn, &describe_q(t), &opts)),
+        "schema" => do_eval(&conn, SCHEMA_Q, &opts),
+        "functions" => do_eval(&conn, &functions_q(&arg), &opts),
         "info" => do_eval(&conn, INFO_Q, &opts),
         "gc" => do_eval(&conn, ".Q.gc[]", &opts),
         "time" => {
@@ -164,7 +198,7 @@ fn real_main() -> i32 {
             }
         }
         other => Err(E::usage(format!(
-            "unknown mode '{}' (query|run|ping|tables|meta|count|describe|info|time|gc|web|trace|config)",
+            "unknown mode '{}' (query|run|ping|tables|meta|count|describe|schema|functions|info|time|gc|web|trace|config)",
             other
         ))),
     };
@@ -244,6 +278,22 @@ fn describe_q(t: &str) -> String {
     )
 }
 
+/// Whole-DB overview in ONE round-trip: per table, partitioned? + partition
+/// field + row count + column count, razed server-side into a single table.
+/// `.Q.pf` is trapped (unset on a non-partitioned process). `count` on a
+/// partitioned table uses cached partition counts — it never forces a full load.
+const SCHEMA_Q: &str = "{ts:tables[]; tv:value each ts; qp:.Q.qp each tv; pf:@[{.Q.pf};::;`]; ([] table:ts; partitioned:qp~\\:1b; partition:?[qp~\\:1b;pf;`]; rows:count each tv; columns:count each cols each tv)}[]";
+
+/// List functions in a namespace (root by default), with arity. `system "f .."`
+/// yields the short names; we re-qualify them so `value value` can reach each
+/// lambda's param list. Arity is trapped to a null int for anything non-lambda.
+fn functions_q(ns: &str) -> String {
+    let ns = ns.trim_start_matches('.');
+    let nsym = if ns.is_empty() { "`".to_string() } else { format!("`{}", ns) };
+    const BODY: &str = "{[ns] fs:system $[ns~`;\"f\";\"f .\",string ns]; pre:$[ns~`;\"\";\".\",(string ns),\".\"]; full:`$pre,/:string each fs; ([] func:fs; args:{@[{count (value value x)1};x;0Ni]} each full)}";
+    format!("{}[{}]", BODY, nsym)
+}
+
 /// Wrap an expression so the server times it and returns `ms` + result `count`.
 fn time_q(expr: &str) -> String {
     format!(
@@ -303,6 +353,8 @@ fn print_usage() {
          \x20 q-cli [OUT] meta     <conn> <table>\n\
          \x20 q-cli [OUT] count    <conn> <table>\n\
          \x20 q-cli [OUT] describe <conn> <table>   (partitioning+schema+rows+sample)\n\
+         \x20 q-cli [OUT] schema   <conn>            (all tables: rows/cols/partition)\n\
+         \x20 q-cli [OUT] functions <conn> [ns]      (defined funcs + arity; root|.ns)\n\
          \x20 q-cli [OUT] info     <conn>            (version/pid/port/mem/handles)\n\
          \x20 q-cli [OUT] time     <conn> \"<q expr>\" (elapsed ms + result count)\n\
          \x20 q-cli       gc       <conn>            (.Q.gc[] -> bytes freed to OS)\n\
@@ -321,20 +373,21 @@ fn print_usage() {
          \x20 --csv           CSV (tables only; uncapped)\n\
          \x20 --console       let the q server format via .Q.s\n\
          \x20 --max-rows N    row cap for text/json (0 = unlimited)\n\
+         \x20 --timeout MS    query wait in ms (default 30000; or Q_CLI_TIMEOUT)\n\
          \x20 --readonly      reject mutating q (or set Q_CLI_READONLY=1)\n\
          \n\
-         EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error\n"
+         EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n"
     );
 }
 
-fn do_ping(conn: &str) -> R {
-    let mut c = Conn::open(conn)?;
+fn do_ping(conn: &str, opts: &Opts) -> R {
+    let mut c = Conn::open(conn, opts.timeout)?;
     let _ = c.sync("1+1")?;
     Ok("pong".to_string())
 }
 
 fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
-    let mut c = Conn::open(conn)?;
+    let mut c = Conn::open(conn, opts.timeout)?;
     // --console: let q render the result string (.Q.s) for max fidelity.
     let to_send = if opts.out == OutMode::Console {
         format!(".Q.s value \"{}\"", q_escape(expr))
@@ -385,7 +438,8 @@ struct Conn {
 
 impl Conn {
     /// Parse `host:port[:user:pass]`, connect, and perform the login handshake.
-    fn open(conn: &str) -> Result<Conn, E> {
+    /// `timeout` bounds the query wait (socket read) and caps connect at 5s.
+    fn open(conn: &str, timeout: Duration) -> Result<Conn, E> {
         let parts: Vec<&str> = conn.split(':').collect();
         if parts.len() < 2 {
             return Err(E::usage(format!("bad connection '{}', expected host:port", conn)));
@@ -409,22 +463,33 @@ impl Conn {
         if addrs.is_empty() {
             return Err(E::connect(format!("no address for {}:{}", host, port)));
         }
+        // Connect timeout is capped at 5s (a refused/unreachable host should
+        // fail fast); the read timeout uses the full --timeout (slow queries).
+        let connect_to = timeout.min(Duration::from_secs(5));
         // try every resolved address (localhost -> ::1 and 127.0.0.1).
         let mut stream = None;
-        let mut last = String::new();
+        let mut last: Option<std::io::Error> = None;
         for addr in &addrs {
-            match TcpStream::connect_timeout(addr, Duration::from_secs(5)) {
+            match TcpStream::connect_timeout(addr, connect_to) {
                 Ok(s) => {
                     stream = Some(s);
                     break;
                 }
-                Err(e) => last = e.to_string(),
+                Err(e) => last = Some(e),
             }
         }
-        let stream = stream
-            .ok_or_else(|| E::connect(format!("connect {}:{} failed: {}", host, port, last)))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                let prefix = format!("connect {}:{} failed", host, port);
+                return Err(match last {
+                    Some(e) => io_err(&prefix, &e),
+                    None => E::connect(prefix),
+                });
+            }
+        };
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout.min(Duration::from_secs(10)))).ok();
 
         let mut c = Conn { stream };
         c.handshake(&creds)?;
@@ -440,9 +505,14 @@ impl Conn {
             .write_all(&msg)
             .map_err(|e| E::connect(format!("handshake write failed: {}", e)))?;
         let mut resp = [0u8; 1];
-        self.stream
-            .read_exact(&mut resp)
-            .map_err(|_| E::connect("authentication failed (server closed connection)"))?;
+        self.stream.read_exact(&mut resp).map_err(|e| {
+            use std::io::ErrorKind::{TimedOut, WouldBlock};
+            if matches!(e.kind(), TimedOut | WouldBlock) {
+                io_err("handshake", &e)
+            } else {
+                E::connect("authentication failed (server closed connection)")
+            }
+        })?;
         Ok(())
     }
 
@@ -470,7 +540,7 @@ impl Conn {
         let mut hdr = [0u8; 8];
         self.stream
             .read_exact(&mut hdr)
-            .map_err(|e| E::connect(format!("no response header: {}", e)))?;
+            .map_err(|e| io_err("no response header", &e))?;
         let le = hdr[0] == 1;
         let compressed = hdr[2] == 1;
         let len = if le {
@@ -484,7 +554,7 @@ impl Conn {
         let mut payload = vec![0u8; len - 8];
         self.stream
             .read_exact(&mut payload)
-            .map_err(|e| E::connect(format!("truncated response: {}", e)))?;
+            .map_err(|e| io_err("truncated response", &e))?;
 
         if compressed {
             payload = k::decompress(&payload, le).map_err(E::query)?;

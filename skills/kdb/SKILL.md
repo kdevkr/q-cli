@@ -25,6 +25,8 @@ q-cli [OUT] tables   <conn>
 q-cli [OUT] meta     <conn> <table>
 q-cli [OUT] count    <conn> <table>
 q-cli [OUT] describe <conn> <table>
+q-cli [OUT] schema   <conn>
+q-cli [OUT] functions <conn> [ns]
 q-cli [OUT] info     <conn>
 q-cli [OUT] time     <conn> "<q expr>"
 q-cli       gc     <conn>
@@ -43,6 +45,12 @@ q-cli       config <init|path|list|add>
   count + a small sample, in **one** call (JSON-friendly). Prefer this as the first
   look at an unknown table — it surfaces the partition column so you know what to
   constrain first.
+- **`schema`** → every table on the process in **one** call: row count, column
+  count, and partition field per table. The fastest first map of an unknown process
+  — run it before `describe`-ing individual tables, so you query the right ones.
+- **`functions [ns]`** → list the functions defined in a namespace (root by
+  default; pass `.u`, `.Q`, etc.) with each one's arity. Use it to find and reuse
+  server-side helpers (`vwap`, `.u.upd`, …) instead of reinventing them.
 - **`info`** → server health snapshot (version, pid, port, used/heap/peak memory,
   open handles, timer) as a dict.
 - **`time <expr>`** → time the expression on the server; returns `ms` + result
@@ -76,12 +84,18 @@ q-cli       config <init|path|list|add>
 - `--max-rows N` → cap text/json at N rows (default 50; `0` = unlimited). On a cap,
   a `note: showing N of M rows` goes to **stderr** (stdout stays pure data) — use a
   small N to save context, `0` when you need every row.
+- `--timeout MS` (or `Q_CLI_TIMEOUT`) → how long to wait for a result, ms (default
+  30000; also caps connect at 5000). On exceed: `kind:"timeout"`, **exit 5** — so a
+  hung/heavy query fails fast instead of blocking you. Raise it before a known-heavy
+  `select`; lower it (e.g. `--timeout 3000`) when you want a quick liveness probe.
 - `--readonly` (or `Q_CLI_READONLY=1`) → refuse mutating q (`delete`/`update`/`set`/
   `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`. Heuristic, not a sandbox.
 
 **Exit codes** — branch on these instead of parsing text: `0` ok · `2` usage/policy
-(bad args, unknown server, readonly block) · `3` connection (retry/ping) · `4` q
-error (fix the query). With `--json`, errors are `{"error","kind"}` on stderr.
+(bad args, unknown server, readonly block) · `3` connection (refused/unreachable —
+retry/ping) · `4` q error (fix the query) · `5` timeout (query exceeded
+`--timeout` — raise it or simplify the query; **don't** treat it like a refused
+connection). With `--json`, errors are `{"error","kind"}` on stderr.
 
 **Gotchas**
 - Failures print `ERR ...` on stderr, non-zero exit (connection refused, bad query
@@ -98,9 +112,11 @@ error (fix the query). With `--json`, errors are `{"error","kind"}` on stderr.
 
 1. **Confirm host:port** (ask if unknown), then `q-cli ping <hp>` to verify.
    `q-cli info <hp>` is a good first look (version, memory, handles).
-2. **Discover schema before querying** — never assume columns. The fastest path is
-   `q-cli describe <hp> <table>`, which returns partitioning + columns/types + row
-   count + a sample in one call; otherwise `q-cli tables`/`meta`/`count`.
+2. **Discover schema before querying** — never assume columns. Map the whole
+   process first with `q-cli schema <hp>` (every table → rows/cols/partition in one
+   call), then drill into a specific table with `q-cli describe <hp> <table>`
+   (partitioning + columns/types + row count + sample in one call); `tables`/`meta`/
+   `count` are the finer-grained fallbacks.
 3. **Check partitioning FIRST for any historical/HDB table, before writing a
    query.** Many tables are partitioned (by `date`, or `month`/`year`/`int`):
    - `q-cli query <hp> '.Q.qp trade'` → `1b` if partitioned.
@@ -126,7 +142,8 @@ error (fix the query). With `--json`, errors are `{"error","kind"}` on stderr.
 - Match kdb idioms: vector-first, avoid loops, use `select`/`update`/`exec`, qsql
   over manual indexing, functional forms only when needed.
 - Reuse any helper functions already defined on the server rather than reinventing
-  them (check with `q-cli query <hp> 'key \`.f'` or list root vars).
+  them — list them with `q-cli functions <hp>` (root) or `q-cli functions <hp> .u`
+  (a namespace); it shows each function's arity.
 - Validate snippets with `q-cli run <hp> file.q` (or `query`) against a scratch
   process, then read the output — show the result, not just the code. Turn on
   `trace` while debugging to see where a failing snippet errors.
