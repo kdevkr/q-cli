@@ -78,6 +78,10 @@ fn real_main() -> i32 {
                 cmd::print_usage();
                 return 0;
             }
+            "-V" | "--version" => {
+                println!("q-cli {}", env!("CARGO_PKG_VERSION"));
+                return 0;
+            }
             s if s.starts_with("--max-rows=") => match s[11..].parse::<usize>() {
                 Ok(n) => max_rows = n,
                 Err(_) => {

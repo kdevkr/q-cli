@@ -48,8 +48,8 @@ pub enum Spec {
 }
 
 pub const CMDS: &[Cmd] = &[
-    Cmd { name: "query", help: "<conn> \"<q expr>\"          run a q expression",
-          spec: Spec::Eval { build: |e| Ok(e.to_string()), guard: true } },
+    Cmd { name: "query", help: "<conn> \"<q expr>\"|-        run a q expression (- = stdin)",
+          spec: Spec::Eval { build: build_query, guard: true } },
     Cmd { name: "run", help: "<conn> <path.q>            send a .q file",
           spec: Spec::Eval { build: build_run, guard: true } },
     Cmd { name: "tables", help: "<conn>                     list tables",
@@ -144,16 +144,39 @@ fn resolve(tok: Option<&String>, mode: &str) -> Result<String, E> {
 
 // --- Eval builders that need more than a one-line closure --------------------
 
+/// Read all of stdin as the q source — the `-` argument for query/run/time, so
+/// generated or multi-line expressions can be piped in instead of quoted inline.
+fn slurp_stdin() -> R {
+    use std::io::Read;
+    let mut s = String::new();
+    std::io::stdin()
+        .read_to_string(&mut s)
+        .map_err(|e| E::usage(format!("cannot read stdin: {}", e)))?;
+    Ok(s)
+}
+
+fn build_query(e: &str) -> R {
+    if e == "-" {
+        slurp_stdin()
+    } else {
+        Ok(e.to_string())
+    }
+}
+
 fn build_run(path: &str) -> R {
+    if path == "-" {
+        return slurp_stdin();
+    }
     std::fs::read_to_string(path)
         .map_err(|e| E::usage(format!("cannot read file '{}': {}", path, e)))
 }
 
 fn build_time(expr: &str) -> R {
+    let expr = if expr == "-" { slurp_stdin()? } else { expr.to_string() };
     if expr.is_empty() {
         Err(E::usage("usage: q-cli time <conn> <expr>"))
     } else {
-        Ok(query::time_q(expr))
+        Ok(query::time_q(&expr))
     }
 }
 
@@ -258,13 +281,44 @@ pub fn finish(result: R, opts: &Opts) -> i32 {
     }
 }
 
+/// Blank out the contents of q double-quoted string literals so the readonly
+/// scan matches keywords in *code*, not in *data* — e.g. `like "*delete*"` must
+/// not trip the `delete` denylist. Backslash escapes inside a string are
+/// honoured. (A symbol literal like `` `delete `` is still scanned — rare, and
+/// erring toward over-blocking is the safe default for a readonly guard.)
+fn strip_q_strings(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next(); // skip the escaped char (e.g. \" or \\)
+                }
+                '"' => {
+                    in_str = false;
+                    out.push('"');
+                }
+                _ => {} // drop the string's contents
+            }
+        } else if c == '"' {
+            in_str = true;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Readonly guard: in readonly mode, reject arbitrary q that looks mutating.
 /// This is a heuristic denylist (q is not SQL), not a sandbox.
 fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
     if !opts.readonly {
         return Ok(());
     }
-    let lower = expr.to_lowercase();
+    let lower = strip_q_strings(expr).to_lowercase();
     for op in ["0:", "1:"] {
         if lower.contains(op) {
             return Err(E::usage(format!(
@@ -326,6 +380,7 @@ pub fn print_usage() {
     }
     s.push_str(
         "\n\
+         query/run/time accept '-' to read the q source from stdin.\n\
          CONN: host:port[:user:pass] | @name | name | @ (default)\n\
          \x20 config (merged, project overrides global):\n\
          \x20   global  $Q_CLI_CONFIG or ~/.config/q-cli/servers.conf\n\
@@ -342,4 +397,51 @@ pub fn print_usage() {
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
     eprint!("{}", s);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ro_opts() -> Opts {
+        Opts { out: OutMode::Text, max_rows: 0, readonly: true, timeout: None }
+    }
+
+    #[test]
+    fn strip_keeps_code_drops_string_contents() {
+        assert_eq!(strip_q_strings("a\"delete\"b"), "a\"\"b");
+        assert_eq!(strip_q_strings("like \"*x\\\"y*\""), "like \"\"");
+        assert_eq!(strip_q_strings("no strings here"), "no strings here");
+    }
+
+    #[test]
+    fn readonly_blocks_mutating_code() {
+        assert!(ro("delete from t", &ro_opts()).is_err());
+        assert!(ro("`t insert (1;2)", &ro_opts()).is_err());
+        assert!(ro("save `:x set til 3", &ro_opts()).is_err());
+        assert!(ro("(`:f) 0: \"x\"", &ro_opts()).is_err()); // file I/O
+    }
+
+    #[test]
+    fn readonly_allows_reads_and_string_literal_keywords() {
+        assert!(ro("select from t", &ro_opts()).is_ok());
+        // the keyword appears only inside a string literal -> not a mutation
+        assert!(ro("select from t where note like \"*delete*\"", &ro_opts()).is_ok());
+    }
+
+    #[test]
+    fn readonly_off_allows_everything() {
+        let opts = Opts { readonly: false, ..ro_opts() };
+        assert!(ro("delete from t", &opts).is_ok());
+    }
+
+    #[test]
+    fn table_name_validation() {
+        assert!(need_table("trade").is_ok());
+        assert!(need_table(".ns.trade").is_ok());
+        assert!(need_table("t_1").is_ok());
+        assert!(need_table("foo bar").is_err());
+        assert!(need_table("").is_err());
+        assert!(need_table("1trade").is_err()); // must not start with a digit
+    }
 }

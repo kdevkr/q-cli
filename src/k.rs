@@ -545,6 +545,9 @@ pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
     let mut d = 4usize; // read index into src (after the size word)
     let mut i: u32 = 0;
     let mut f: u32 = 0;
+    // Every src/dst index below is bounds-checked: a corrupt or malicious
+    // response must surface as Err (-> exit 4), never an out-of-bounds panic
+    // (which, with panic=abort, would kill the process and lose the exit code).
     while s < dst.len() {
         if i == 0 {
             if d >= src.len() {
@@ -555,22 +558,27 @@ pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
             i = 1;
         }
         if (f & i) != 0 {
-            let mut r = aa[src[d] as usize];
-            d += 1;
-            dst[s] = dst[r];
-            s += 1;
-            r += 1;
-            dst[s] = dst[r];
-            s += 1;
-            r += 1;
-            let n = src[d] as usize;
-            d += 1;
-            for _ in 0..n {
-                dst[s] = dst[r];
+            // back-reference: src[d] selects the copy source, src[d+1] the extra
+            // length; the run copies 2 + that many bytes from earlier in dst.
+            if d + 1 >= src.len() {
+                return Err("decompress overrun (back-reference)".to_string());
+            }
+            let mut r = aa[src[d] as usize]; // copy source: a pointer back into dst
+            let mut remaining = src[d + 1] as usize + 2; // 2 + extra length
+            d += 2;
+            while remaining > 0 {
+                if s >= dst.len() || r >= dst.len() {
+                    return Err("decompress output overrun".to_string());
+                }
+                dst[s] = dst[r]; // byte-by-byte so overlapping (LZ) runs work
                 s += 1;
                 r += 1;
+                remaining -= 1;
             }
         } else {
+            if d >= src.len() {
+                return Err("decompress overrun (literal)".to_string());
+            }
             dst[s] = src[d];
             s += 1;
             d += 1;
@@ -588,4 +596,57 @@ pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
         }
     }
     Ok(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // kdb+ epoch is 2000.01.01 == day 0.
+    #[test]
+    fn temporal_epoch_and_boundaries() {
+        assert_eq!(fmt_date(0), "2000.01.01");
+        assert_eq!(fmt_date(30), "2000.01.31");
+        assert_eq!(fmt_date(31), "2000.02.01");
+        assert_eq!(fmt_date(-1), "1999.12.31");
+        assert_eq!(fmt_month(0), "2000.01");
+        assert_eq!(fmt_month(13), "2001.02");
+        assert_eq!(fmt_timestamp(0), "2000.01.01D00:00:00.000000000");
+        assert_eq!(fmt_time(3_600_000), "01:00:00.000");
+        assert_eq!(fmt_minute(90), "01:30");
+        assert_eq!(fmt_second(3661), "01:01:01");
+    }
+
+    #[test]
+    fn temporal_nulls_render_empty() {
+        assert_eq!(fmt_date(NULL_INT), "");
+        assert_eq!(fmt_timestamp(NULL_LONG), "");
+        assert_eq!(fmt_time(NULL_INT), "");
+    }
+
+    #[test]
+    fn guid_formats_canonically() {
+        let g = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ];
+        assert_eq!(fmt_guid(&g), "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    // A stream with no back-references: one 0x00 control byte then literal bytes.
+    #[test]
+    fn decompress_literal_only_roundtrip() {
+        // [usize_total=11 (=8 header + 3 data)][control 0x00][1,2,3]
+        let src = [11u8, 0, 0, 0, 0x00, 1, 2, 3];
+        assert_eq!(decompress(&src, true).unwrap(), vec![1u8, 2, 3]);
+    }
+
+    // A truncated back-reference must return Err, never panic (panic=abort would
+    // crash the process and lose the structured exit code).
+    #[test]
+    fn decompress_malformed_is_err_not_panic() {
+        let src = [100u8, 0, 0, 0, 0x01, 5]; // control bit set but no ref bytes
+        assert!(decompress(&src, true).is_err());
+        assert!(decompress(&[1u8], true).is_err()); // too short for the size word
+    }
 }

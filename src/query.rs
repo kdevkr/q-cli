@@ -57,3 +57,39 @@ pub fn q_escape(s: &str) -> String {
     }
     o
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_special_chars() {
+        assert_eq!(q_escape("a\"b\\c\n"), "a\\\"b\\\\c\\n");
+        assert_eq!(q_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn time_q_wraps_and_escapes() {
+        let q = time_q("select from t");
+        assert!(q.contains(".z.p")); // times the call
+        assert!(q.contains("`ms`count!")); // returns ms + count, not the data
+        // the inner expression is embedded as an escaped string literal
+        let q2 = time_q("a\"b");
+        assert!(q2.contains("a\\\"b"));
+    }
+
+    #[test]
+    fn functions_q_root_vs_namespace() {
+        let root = functions_q("");
+        assert!(root.contains("[`]")); // root namespace passed as `
+        let ns = functions_q(".Q");
+        assert!(ns.contains("[`Q]")); // leading dot stripped, symbol-qualified
+    }
+
+    #[test]
+    fn describe_q_targets_the_table() {
+        let q = describe_q("trade");
+        assert!(q.ends_with("`trade"));
+        assert!(q.contains(".Q.qp")); // partition probe
+    }
+}

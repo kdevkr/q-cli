@@ -309,3 +309,28 @@ fn mask(conn: &str) -> String {
         conn.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_skips_comments_and_blanks() {
+        let m = parse("# comment\n\ndefault = local\nlocal = host:5000  \n");
+        assert_eq!(m.get("default").map(String::as_str), Some("local"));
+        assert_eq!(m.get("local").map(String::as_str), Some("host:5000"));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn parse_ignores_malformed_lines() {
+        let m = parse("nokey\n= noval\nk =\n");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn mask_hides_only_the_password() {
+        assert_eq!(mask("host:5000:user:secret"), "host:5000:user:****");
+        assert_eq!(mask("host:5000"), "host:5000"); // nothing to hide
+    }
+}

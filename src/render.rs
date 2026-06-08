@@ -388,3 +388,58 @@ pub fn json_string(s: &str) -> String {
     out.push('"');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // table: a:1 2 (with a null), b:`x`y
+    fn sample_table() -> K {
+        K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["a".into(), "b".into()])),
+            Box::new(K::List(vec![
+                K::IntV(vec![1, NULL_INT]),
+                K::SymbolV(vec!["x".into(), "y".into()]),
+            ])),
+        )))
+    }
+
+    #[test]
+    fn table_to_json_rows() {
+        assert_eq!(
+            to_json(&sample_table(), 0),
+            r#"[{"a":1,"b":"x"},{"a":null,"b":"y"}]"#
+        );
+    }
+
+    #[test]
+    fn table_to_csv_with_null_cell() {
+        assert_eq!(to_csv(&sample_table()), "a,b\n1,x\n,y");
+    }
+
+    #[test]
+    fn json_respects_max_rows() {
+        assert_eq!(to_json(&sample_table(), 1), r#"[{"a":1,"b":"x"}]"#);
+    }
+
+    #[test]
+    fn csv_field_quotes_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("she said \"hi\""), "\"she said \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn scalar_nulls_and_floats() {
+        assert_eq!(scalar_to_string(&K::Int(NULL_INT)), "");
+        assert_eq!(scalar_to_string(&K::Long(42)), "42");
+        assert_eq!(fmt_float(f64::INFINITY), "0w");
+        assert_eq!(fmt_float(f64::NAN), "");
+    }
+
+    #[test]
+    fn json_floats_nonfinite_are_null() {
+        assert_eq!(json_frag(&K::Float(f64::NAN)), "null");
+        assert_eq!(json_frag(&K::Float(1.5)), "1.5");
+    }
+}

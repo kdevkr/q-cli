@@ -6,8 +6,8 @@ speaking the kdb+ wire protocol directly — no `q.exe`, no license, no dependen
 
 ## Usage
 ```
-q-cli [OUT] query  <conn> "<q expression>"
-q-cli [OUT] run    <conn> <path.q>
+q-cli [OUT] query  <conn> "<q expression>"   # or `-` to read the expr from stdin
+q-cli [OUT] run    <conn> <path.q>           # or `-` to read q source from stdin
 q-cli [OUT] tables <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
@@ -29,8 +29,10 @@ q-cli config init
 q-cli config add prod bigbox:5001:user:pass     # add/update an entry
 q-cli config list                               # show servers (passwords masked)
 
+q-cli --version                                 # print the version and exit
 q-cli ping  localhost:5555
 q-cli query localhost:5555 'select avg price by sym from trade'
+cat report.q | q-cli query @ -                  # pipe a generated/multi-line expr
 q-cli --json query @prod 'select sym,price from trade'    # array of row objects
 q-cli --csv  query @prod 'select from trade' > trade.csv  # export (uncapped)
 q-cli --console query @ 'flip 0!exec sym from trade'      # q renders it (.Q.s)
@@ -75,7 +77,9 @@ q-cli config path                    # show both layers and which project file i
 - `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
   (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
   `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`, **not a
-  sandbox** — guards an agent from accidentally mutating data. It also blocks the
+  sandbox** — guards an agent from accidentally mutating data. Keywords inside a
+  string literal (e.g. `… like "*delete*"`) are ignored, so reads aren't
+  false-blocked. It also blocks the
   server-mutating `web off`/`web get-ok` and `trace on`/`trace off` (which rebind
   `.z.*` handlers); the `status` forms stay allowed.
 
