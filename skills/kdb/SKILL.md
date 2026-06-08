@@ -84,18 +84,22 @@ q-cli       config <init|path|list|add>
 - `--max-rows N` → cap text/json at N rows (default 50; `0` = unlimited). On a cap,
   a `note: showing N of M rows` goes to **stderr** (stdout stays pure data) — use a
   small N to save context, `0` when you need every row.
-- `--timeout MS` (or `Q_CLI_TIMEOUT`) → how long to wait for a result, ms (default
-  30000; also caps connect at 5000). On exceed: `kind:"timeout"`, **exit 5** — so a
-  hung/heavy query fails fast instead of blocking you. Raise it before a known-heavy
-  `select`; lower it (e.g. `--timeout 3000`) when you want a quick liveness probe.
+- `--timeout MS` (or `Q_CLI_TIMEOUT`) → how long to wait for the query round-trip,
+  ms (default 30000; **`0` = wait forever**; also caps connect at 5000). Only a
+  round-trip timeout is **exit 5** (the query is too slow); an unreachable host or
+  connect timeout is **exit 3**. Raise it before a known-heavy `select` (or use
+  `0`); lower it (e.g. `--timeout 3000`) for a quick liveness probe.
 - `--readonly` (or `Q_CLI_READONLY=1`) → refuse mutating q (`delete`/`update`/`set`/
-  `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`. Heuristic, not a sandbox.
+  `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`, and block the
+  server-mutating `web off`/`web get-ok` / `trace on`/`trace off` (their `status`
+  forms stay allowed). Heuristic, not a sandbox.
 
 **Exit codes** — branch on these instead of parsing text: `0` ok · `2` usage/policy
-(bad args, unknown server, readonly block) · `3` connection (refused/unreachable —
-retry/ping) · `4` q error (fix the query) · `5` timeout (query exceeded
-`--timeout` — raise it or simplify the query; **don't** treat it like a refused
-connection). With `--json`, errors are `{"error","kind"}` on stderr.
+(bad args, unknown server, readonly block) · `3` connection (refused/unreachable,
+incl. connect/handshake timeout — retry/ping) · `4` q error (fix the query) · `5`
+timeout (the query round-trip exceeded `--timeout` — raise it or simplify the
+query; **don't** treat it like a refused connection). With `--json`, errors are
+`{"error","kind"}` on stderr.
 
 **Gotchas**
 - Failures print `ERR ...` on stderr, non-zero exit (connection refused, bad query

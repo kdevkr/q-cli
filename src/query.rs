@@ -8,9 +8,11 @@ pub const INFO_Q: &str = "(`version`pid`port`handles`timer!(.z.K;.z.i;first syst
 /// field + row count + column count, razed server-side into a single table.
 /// `.Q.pf` is trapped (unset on a non-partitioned process). `count` on a
 /// partitioned table uses cached partition counts — it never forces a full load.
-/// Locals avoid q reserved names (`i`); the `columns` column avoids the `cols`
-/// keyword — either would raise `'assign`.
-pub const SCHEMA_Q: &str = "{ts:tables[]; tv:value each ts; qp:.Q.qp each tv; pf:@[{.Q.pf};::;`]; ([] table:ts; partitioned:qp~\\:1b; partition:?[qp~\\:1b;pf;`]; rows:count each tv; columns:count each cols each tv)}[]";
+/// Each table is probed under its OWN `@[...]` trap, so one unreadable table
+/// (corrupt/locked partition) yields null counts instead of failing the whole
+/// command. Locals avoid q reserved names (`i`); the `columns` column avoids the
+/// `cols` keyword — either would raise `'assign`.
+pub const SCHEMA_Q: &str = "{ts:tables[]; pf:@[{.Q.pf};::;`]; f:{[pf;t] @[{[pf;t] tt:value t; qp:.Q.qp tt; (qp~1b;$[qp~1b;pf;`];count tt;count cols tt)}[pf;]; t; (0b;`;0N;0N)]}; r:f[pf;] each ts; ([] table:ts; partitioned:r[;0]; partition:r[;1]; rows:r[;2]; columns:r[;3])}[]";
 
 /// One-shot table profile: name, partitioned?, partition field, rows, columns
 /// (meta), and a small sample. Sample is skipped for partitioned tables so we

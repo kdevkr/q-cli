@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::error::{io_err, is_timeout, E};
+use crate::error::{io_err, E};
 use crate::k::{self, Reader, K};
 
 /// A live IPC connection to a q process.
@@ -17,8 +17,9 @@ pub struct Conn {
 
 impl Conn {
     /// Parse `host:port[:user:pass]`, connect, and perform the login handshake.
-    /// `timeout` bounds the query wait (socket read) and caps connect at 5s.
-    pub fn open(conn: &str, timeout: Duration) -> Result<Conn, E> {
+    /// `timeout` bounds the query round-trip (socket read/write) and caps connect
+    /// at 5s; `None` means no timeout (block until the server responds).
+    pub fn open(conn: &str, timeout: Option<Duration>) -> Result<Conn, E> {
         let parts: Vec<&str> = conn.split(':').collect();
         if parts.len() < 2 {
             return Err(E::usage(format!("bad connection '{}', expected host:port", conn)));
@@ -43,14 +44,19 @@ impl Conn {
             return Err(E::connect(format!("no address for {}:{}", host, port)));
         }
 
-        // Connect timeout is capped at 5s (a refused/unreachable host should
-        // fail fast); the read timeout uses the full --timeout (slow queries).
-        let connect_to = timeout.min(Duration::from_secs(5));
-        // try every resolved address (localhost -> ::1 and 127.0.0.1).
+        // Establishment (connect + handshake) failures are always reported as
+        // `connect` (exit 3), never `timeout` — an unreachable host is a
+        // connection problem, not a slow query. Connect is capped at 5s when a
+        // timeout is set, and blocks (OS default) when `--timeout 0` = no timeout.
+        // Try every resolved address (localhost -> ::1 and 127.0.0.1).
         let mut stream = None;
         let mut last: Option<std::io::Error> = None;
         for addr in &addrs {
-            match TcpStream::connect_timeout(addr, connect_to) {
+            let res = match timeout {
+                Some(t) => TcpStream::connect_timeout(addr, t.min(Duration::from_secs(5))),
+                None => TcpStream::connect(addr),
+            };
+            match res {
                 Ok(s) => {
                     stream = Some(s);
                     break;
@@ -63,13 +69,17 @@ impl Conn {
             None => {
                 let prefix = format!("connect {}:{} failed", host, port);
                 return Err(match last {
-                    Some(e) => io_err(&prefix, &e),
+                    Some(e) => E::connect(format!("{}: {}", prefix, e)),
                     None => E::connect(prefix),
                 });
             }
         };
-        stream.set_read_timeout(Some(timeout)).ok();
-        stream.set_write_timeout(Some(timeout.min(Duration::from_secs(10)))).ok();
+        // The read/write timeout bounds the query round-trip; `None` = wait
+        // forever. A timeout here surfaces as `timeout` (exit 5) from `sync`.
+        stream.set_read_timeout(timeout).ok();
+        stream
+            .set_write_timeout(timeout.map(|t| t.min(Duration::from_secs(10))))
+            .ok();
 
         let mut c = Conn { stream };
         c.handshake(&creds)?;
@@ -85,13 +95,11 @@ impl Conn {
             .write_all(&msg)
             .map_err(|e| E::connect(format!("handshake write failed: {}", e)))?;
         let mut resp = [0u8; 1];
-        self.stream.read_exact(&mut resp).map_err(|e| {
-            if is_timeout(&e) {
-                io_err("handshake", &e)
-            } else {
-                E::connect("authentication failed (server closed connection)")
-            }
-        })?;
+        // Still part of establishment: any failure here (closed, reset, or a
+        // stalled login that hit the read timeout) is a connection problem (3).
+        self.stream
+            .read_exact(&mut resp)
+            .map_err(|_| E::connect("authentication failed (no login reply from server)"))?;
         Ok(())
     }
 
@@ -112,9 +120,11 @@ impl Conn {
         msg.push(0);
         msg.extend_from_slice(&total.to_le_bytes());
         msg.extend_from_slice(&body);
+        // Query round-trip: a write/read timeout here is `timeout` (exit 5),
+        // matching the response-read path below.
         self.stream
             .write_all(&msg)
-            .map_err(|e| E::connect(format!("send failed: {}", e)))?;
+            .map_err(|e| io_err("send failed", &e))?;
 
         let mut hdr = [0u8; 8];
         self.stream

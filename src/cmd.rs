@@ -21,7 +21,7 @@ pub struct Opts {
     pub out: OutMode,
     pub max_rows: usize, // 0 = unlimited
     pub readonly: bool,
-    pub timeout: Duration, // governs the query wait (and caps connect)
+    pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
 /// One CLI command, expressed as data.
@@ -96,37 +96,50 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
         Spec::Action(make) => {
             // <action> <conn> — action first, connection second.
             let action = pos.get(1).map(|s| s.as_str()).unwrap_or("");
+            // Validate the action first (so a bad verb gets its own message),
+            // then enforce readonly: for web/trace, every action except `status`
+            // rebinds a server message handler (.z.ph/.z.pp/.z.pg/.z.ps) — a
+            // server mutation the readonly guard must also cover, not just data.
             match make(action) {
-                Ok(expr) => run_on(pos.get(2), &expr, opts),
                 Err(e) => finish(Err(e), opts),
+                Ok(_) if opts.readonly && action != "status" => finish(
+                    Err(E::usage(format!(
+                        "readonly: '{} {}' changes server handlers; unset --readonly / Q_CLI_READONLY to allow",
+                        mode, action
+                    ))),
+                    opts,
+                ),
+                Ok(expr) => run_on(pos.get(2), &expr, opts),
             }
         }
-        Spec::Ping | Spec::Eval { .. } => {
-            // <conn> [arg]
-            let tok = match pos.get(1) {
-                Some(c) => c,
-                None => {
-                    return finish(Err(E::usage(format!("usage: q-cli {} <conn> ...", mode))), opts)
-                }
-            };
-            let conn = match config::resolve_conn(tok) {
+        // <conn> — handshake probe.
+        Spec::Ping => match resolve(pos.get(1), mode) {
+            Ok(conn) => finish(do_ping(&conn, opts), opts),
+            Err(e) => finish(Err(e), opts),
+        },
+        // <conn> [arg] — build a q expression, optionally guard, eval, render.
+        Spec::Eval { build, guard } => {
+            let conn = match resolve(pos.get(1), mode) {
                 Ok(c) => c,
-                Err(e) => return finish(Err(E::usage(e)), opts),
+                Err(e) => return finish(Err(e), opts),
             };
             let arg = pos.get(2).cloned().unwrap_or_default();
-            let r = match &cmd.spec {
-                Spec::Ping => do_ping(&conn, opts),
-                Spec::Eval { build, guard } => build(&arg).and_then(|expr| {
-                    if *guard {
-                        ro(&expr, opts)?;
-                    }
-                    do_eval(&conn, &expr, opts)
-                }),
-                _ => unreachable!(),
-            };
+            let r = build(&arg).and_then(|expr| {
+                if *guard {
+                    ro(&expr, opts)?;
+                }
+                do_eval(&conn, &expr, opts)
+            });
             finish(r, opts)
         }
     }
+}
+
+/// Resolve the `<conn>` positional (a config name or `host:port`) into a
+/// connection string, or a usage error naming the command if it's missing.
+fn resolve(tok: Option<&String>, mode: &str) -> Result<String, E> {
+    let tok = tok.ok_or_else(|| E::usage(format!("usage: q-cli {} <conn> ...", mode)))?;
+    config::resolve_conn(tok).map_err(E::usage)
 }
 
 // --- Eval builders that need more than a one-line closure --------------------
@@ -275,11 +288,27 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
     Ok(())
 }
 
+/// Validate a table argument is a plain q identifier (optionally namespaced)
+/// before it's interpolated into a q expression, so a stray name like `foo bar`
+/// gives a clean usage error (exit 2) instead of a confusing q parse error.
 fn need_table(t: &str) -> Result<&str, E> {
     if t.is_empty() {
-        Err(E::usage("this command needs a table name"))
-    } else {
+        return Err(E::usage("this command needs a table name"));
+    }
+    let first_ok = t
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '.');
+    let rest_ok = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    if first_ok && rest_ok {
         Ok(t)
+    } else {
+        Err(E::usage(format!(
+            "invalid table name '{}' (expected a q identifier, e.g. trade or .ns.trade)",
+            t
+        )))
     }
 }
 

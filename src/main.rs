@@ -56,22 +56,42 @@ fn real_main() -> i32 {
             "--readonly" => readonly = true,
             "--max-rows" => {
                 i += 1;
-                max_rows = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(max_rows);
+                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => max_rows = n,
+                    None => {
+                        eprintln!("ERR --max-rows requires a numeric value");
+                        return 2;
+                    }
+                }
             }
             "--timeout" => {
                 i += 1;
-                timeout_ms = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(timeout_ms);
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(n) => timeout_ms = n,
+                    None => {
+                        eprintln!("ERR --timeout requires a numeric value (ms; 0 = no timeout)");
+                        return 2;
+                    }
+                }
             }
             "-h" | "--help" => {
                 cmd::print_usage();
                 return 0;
             }
-            s if s.starts_with("--max-rows=") => {
-                max_rows = s[11..].parse().unwrap_or(max_rows);
-            }
-            s if s.starts_with("--timeout=") => {
-                timeout_ms = s[10..].parse().unwrap_or(timeout_ms);
-            }
+            s if s.starts_with("--max-rows=") => match s[11..].parse::<usize>() {
+                Ok(n) => max_rows = n,
+                Err(_) => {
+                    eprintln!("ERR --max-rows requires a numeric value");
+                    return 2;
+                }
+            },
+            s if s.starts_with("--timeout=") => match s[10..].parse::<u64>() {
+                Ok(n) => timeout_ms = n,
+                Err(_) => {
+                    eprintln!("ERR --timeout requires a numeric value (ms; 0 = no timeout)");
+                    return 2;
+                }
+            },
             _ => pos.push(args[i].clone()),
         }
         i += 1;
@@ -80,7 +100,12 @@ fn real_main() -> i32 {
         out,
         max_rows,
         readonly,
-        timeout: Duration::from_millis(timeout_ms.max(1)),
+        // 0 = no timeout (wait forever); otherwise a finite query-round-trip wait.
+        timeout: if timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms))
+        },
     };
 
     if pos.is_empty() {

@@ -65,20 +65,24 @@ q-cli config path                    # show both layers and which project file i
 - `--max-rows N` — row cap for text/json (default 50; `0` = unlimited). When a
   table is capped, a `note: showing N of M rows` is printed to **stderr** so it's
   machine-detectable; stdout stays pure data.
-- `--timeout MS` (or `Q_CLI_TIMEOUT`) — how long to wait for a query result, in
-  milliseconds (default `30000`). Also caps the connect at `min(MS, 5000)`. A
-  read/connect that exceeds it fails with `kind:"timeout"` and **exit 5** — so an
-  agent can tell "the query never came back" (retry / raise the limit) apart from
-  "connection refused" (exit 3). A heavy `select` should set a generous value.
+- `--timeout MS` (or `Q_CLI_TIMEOUT`) — how long to wait for the **query
+  round-trip** (send + receive), in milliseconds (default `30000`; **`0` = no
+  timeout, wait forever**). Also caps the connect at `min(MS, 5000)`. A timeout on
+  the round-trip fails with `kind:"timeout"` and **exit 5** (the query is too slow —
+  retry / raise the limit / use `0`). A failure to *establish* the connection —
+  refused, unreachable, or a connect/handshake timeout — is **exit 3** instead, so
+  an agent can tell "the query never came back" apart from "can't reach the server".
 - `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
   (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
   `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`, **not a
-  sandbox** — guards an agent from accidentally mutating data.
+  sandbox** — guards an agent from accidentally mutating data. It also blocks the
+  server-mutating `web off`/`web get-ok` and `trace on`/`trace off` (which rebind
+  `.z.*` handlers); the `status` forms stay allowed.
 
 **Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
-unknown server, readonly block) · `3` connection (refused/unreachable/auth) ·
-`4` q error (server returned `'…`) · `5` timeout (query/connect exceeded
-`--timeout`). With `--json`, errors print as
+unknown server, readonly block) · `3` connection (refused/unreachable/auth, incl.
+connect/handshake timeout) · `4` q error (server returned `'…`) · `5` timeout (the
+query round-trip exceeded `--timeout`). With `--json`, errors print as
 `{"error":"…","kind":"usage|connect|query|timeout"}` on stderr.
 
 **Subcommands** — `tables` / `meta <t>` / `count <t>` for quick schema discovery;
