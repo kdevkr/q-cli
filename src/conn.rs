@@ -20,21 +20,7 @@ impl Conn {
     /// `timeout` bounds the query round-trip (socket read/write) and caps connect
     /// at 5s; `None` means no timeout (block until the server responds).
     pub fn open(conn: &str, timeout: Option<Duration>) -> Result<Conn, E> {
-        let parts: Vec<&str> = conn.split(':').collect();
-        if parts.len() < 2 {
-            return Err(E::usage(format!("bad connection '{}', expected host:port", conn)));
-        }
-        let host = parts[0];
-        let port: u16 = parts[1]
-            .parse()
-            .map_err(|_| E::usage(format!("bad port '{}'", parts[1])))?;
-        let creds = if parts.len() >= 4 {
-            format!("{}:{}", parts[2], parts[3..].join(":"))
-        } else if parts.len() == 3 {
-            parts[2].to_string()
-        } else {
-            String::new()
-        };
+        let (host, port, creds) = parse_conn(conn)?;
 
         let addrs: Vec<_> = (host, port)
             .to_socket_addrs()
@@ -158,5 +144,86 @@ impl Conn {
 
         let mut r = Reader::new(&payload, le);
         r.read().map_err(E::query)
+    }
+}
+
+/// Parse `host:port[:user:pass]` or `[ipv6]:port[:user:pass]`.
+pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), E> {
+    if let Some(rest) = conn.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| E::usage(format!("bad connection '{}', missing closing ']'", conn)))?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let after = after.strip_prefix(':').ok_or_else(|| {
+            E::usage(format!("bad connection '{}', expected port after ']'", conn))
+        })?;
+        let parts: Vec<&str> = after.split(':').collect();
+        let port: u16 = parts[0]
+            .parse()
+            .map_err(|_| E::usage(format!("bad port '{}'", parts[0])))?;
+        let creds = if parts.len() > 1 {
+            parts[1..].join(":")
+        } else {
+            String::new()
+        };
+        Ok((host, port, creds))
+    } else {
+        let parts: Vec<&str> = conn.split(':').collect();
+        if parts.len() < 2 {
+            return Err(E::usage(format!(
+                "bad connection '{}', expected host:port",
+                conn
+            )));
+        }
+        let host = parts[0];
+        let port: u16 = parts[1]
+            .parse()
+            .map_err(|_| E::usage(format!("bad port '{}'", parts[1])))?;
+        let creds = if parts.len() > 2 {
+            parts[2..].join(":")
+        } else {
+            String::new()
+        };
+        Ok((host, port, creds))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_conn_ipv4_and_hostname() {
+        let (host, port, creds) = parse_conn("localhost:5000").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+
+        let (host, port, creds) = parse_conn("127.0.0.1:5001:user").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 5001);
+        assert_eq!(creds, "user");
+
+        let (host, port, creds) = parse_conn("127.0.0.1:5002:user:pass:extra").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 5002);
+        assert_eq!(creds, "user:pass:extra");
+    }
+
+    #[test]
+    fn parse_conn_ipv6() {
+        let (host, port, creds) = parse_conn("[::1]:5000").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+
+        let (host, port, creds) = parse_conn("[2001:db8::1]:5001:admin:secret").unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 5001);
+        assert_eq!(creds, "admin:secret");
+
+        assert!(parse_conn("[::1]").is_err());
+        assert!(parse_conn("[::1:5000").is_err());
     }
 }

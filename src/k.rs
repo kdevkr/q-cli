@@ -13,7 +13,7 @@ pub enum K {
     Long(i64),
     Real(f32),
     Float(f64),
-    Char(u8),
+    Char(char),
     Symbol(String),
     Timestamp(i64),
     Month(i32),
@@ -181,7 +181,7 @@ impl<'a> Reader<'a> {
             -7 => Ok(K::Long(self.i64()?)),
             -8 => Ok(K::Real(self.f32()?)),
             -9 => Ok(K::Float(self.f64()?)),
-            -10 => Ok(K::Char(self.u8()?)),
+            -10 => Ok(K::Char(self.u8()? as char)),
             -11 => Ok(K::Symbol(self.sym()?)),
             -12 => Ok(K::Timestamp(self.i64()?)),
             -13 => Ok(K::Month(self.i32()?)),
@@ -499,27 +499,28 @@ pub fn len_of(k: &K) -> usize {
 }
 
 /// Extract element `i` of a vector/list K as a scalar K (clones).
+/// Bounds-checked: returns K::Null if `i` is out of bounds, preventing panics on ragged tables.
 pub fn at(k: &K, i: usize) -> K {
     match k {
-        K::BoolV(v) => K::Bool(v[i]),
-        K::GuidV(v) => K::Guid(v[i]),
-        K::ByteV(v) => K::Byte(v[i]),
-        K::ShortV(v) => K::Short(v[i]),
-        K::IntV(v) => K::Int(v[i]),
-        K::LongV(v) => K::Long(v[i]),
-        K::RealV(v) => K::Real(v[i]),
-        K::FloatV(v) => K::Float(v[i]),
-        K::CharV(v) => K::Char(v.as_bytes()[i]),
-        K::SymbolV(v) => K::Symbol(v[i].clone()),
-        K::TimestampV(v) => K::Timestamp(v[i]),
-        K::MonthV(v) => K::Month(v[i]),
-        K::DateV(v) => K::Date(v[i]),
-        K::DatetimeV(v) => K::Datetime(v[i]),
-        K::TimespanV(v) => K::Timespan(v[i]),
-        K::MinuteV(v) => K::Minute(v[i]),
-        K::SecondV(v) => K::Second(v[i]),
-        K::TimeV(v) => K::Time(v[i]),
-        K::List(v) => v[i].clone(),
+        K::BoolV(v) => v.get(i).copied().map(K::Bool).unwrap_or(K::Null),
+        K::GuidV(v) => v.get(i).copied().map(K::Guid).unwrap_or(K::Null),
+        K::ByteV(v) => v.get(i).copied().map(K::Byte).unwrap_or(K::Null),
+        K::ShortV(v) => v.get(i).copied().map(K::Short).unwrap_or(K::Null),
+        K::IntV(v) => v.get(i).copied().map(K::Int).unwrap_or(K::Null),
+        K::LongV(v) => v.get(i).copied().map(K::Long).unwrap_or(K::Null),
+        K::RealV(v) => v.get(i).copied().map(K::Real).unwrap_or(K::Null),
+        K::FloatV(v) => v.get(i).copied().map(K::Float).unwrap_or(K::Null),
+        K::CharV(v) => v.chars().nth(i).map(K::Char).unwrap_or(K::Null),
+        K::SymbolV(v) => v.get(i).cloned().map(K::Symbol).unwrap_or(K::Null),
+        K::TimestampV(v) => v.get(i).copied().map(K::Timestamp).unwrap_or(K::Null),
+        K::MonthV(v) => v.get(i).copied().map(K::Month).unwrap_or(K::Null),
+        K::DateV(v) => v.get(i).copied().map(K::Date).unwrap_or(K::Null),
+        K::DatetimeV(v) => v.get(i).copied().map(K::Datetime).unwrap_or(K::Null),
+        K::TimespanV(v) => v.get(i).copied().map(K::Timespan).unwrap_or(K::Null),
+        K::MinuteV(v) => v.get(i).copied().map(K::Minute).unwrap_or(K::Null),
+        K::SecondV(v) => v.get(i).copied().map(K::Second).unwrap_or(K::Null),
+        K::TimeV(v) => v.get(i).copied().map(K::Time).unwrap_or(K::Null),
+        K::List(v) => v.get(i).cloned().unwrap_or(K::Null),
         other => other.clone(),
     }
 }
@@ -636,14 +637,24 @@ pub fn fmt_minute(m: i32) -> String {
     if m == NULL_INT {
         return String::new();
     }
-    format!("{:02}:{:02}", m / 60, m % 60)
+    let neg = m < 0;
+    let v = m.abs();
+    format!("{}{:02}:{:02}", if neg { "-" } else { "" }, v / 60, v % 60)
 }
 
 pub fn fmt_second(s: i32) -> String {
     if s == NULL_INT {
         return String::new();
     }
-    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    let neg = s < 0;
+    let v = s.abs();
+    format!(
+        "{}{:02}:{:02}:{:02}",
+        if neg { "-" } else { "" },
+        v / 3600,
+        (v / 60) % 60,
+        v % 60
+    )
 }
 
 pub fn fmt_guid(g: &[u8; 16]) -> String {
@@ -829,5 +840,28 @@ mod tests {
         let err = Reader::new(&buf, true).read();
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("max deserialization recursion depth exceeded"));
+    }
+
+    #[test]
+    fn negative_minute_and_second_formatting() {
+        assert_eq!(fmt_minute(-90), "-01:30");
+        assert_eq!(fmt_minute(-5), "-00:05");
+        assert_eq!(fmt_second(-65), "-00:01:05");
+        assert_eq!(fmt_second(-3665), "-01:01:05");
+    }
+
+    #[test]
+    fn at_bounds_checking_prevents_panics() {
+        let v = K::LongV(vec![10, 20]);
+        assert_eq!(at(&v, 0), K::Long(10));
+        assert_eq!(at(&v, 1), K::Long(20));
+        assert_eq!(at(&v, 2), K::Null); // OOB yields K::Null instead of panic
+        assert_eq!(at(&v, 100), K::Null);
+
+        let cv = K::CharV("가나다".into());
+        assert_eq!(at(&cv, 0), K::Char('가'));
+        assert_eq!(at(&cv, 1), K::Char('나'));
+        assert_eq!(at(&cv, 2), K::Char('다'));
+        assert_eq!(at(&cv, 3), K::Null);
     }
 }

@@ -122,16 +122,34 @@ pub fn resolve_conn(token: &str) -> Result<String, String> {
     }
     let key = if name.is_empty() { "default" } else { name };
     let servers = load_merged()?;
+    resolve_alias(key, &servers)
+}
+
+pub fn resolve_alias(key: &str, servers: &HashMap<String, String>) -> Result<String, String> {
+    let mut current = key.to_string();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(current.clone());
 
     let mut val = servers
-        .get(key)
+        .get(&current)
         .cloned()
-        .ok_or_else(|| format!("unknown server '{}' (not in global/project config)", key))?;
-    if !val.contains(':') {
+        .ok_or_else(|| format!("unknown server '{}' (not in global/project config)", current))?;
+
+    let mut hops = 0;
+    while !val.contains(':') {
+        hops += 1;
+        if hops > 16 || visited.contains(&val) {
+            return Err(format!(
+                "alias cycle or too many redirects starting at '{}'",
+                key
+            ));
+        }
+        visited.insert(val.clone());
+        current = val.clone();
         val = servers
-            .get(&val)
+            .get(&current)
             .cloned()
-            .ok_or_else(|| format!("server '{}' points at undefined '{}'", key, val))?;
+            .ok_or_else(|| format!("server '{}' points at undefined '{}'", current, val))?;
     }
     Ok(val)
 }
@@ -302,9 +320,22 @@ fn add(target: &Path, name: &str, conn: &str) -> Result<String, String> {
 
 /// Hide the password component of a host:port:user:pass connection string.
 fn mask(conn: &str) -> String {
-    let parts: Vec<&str> = conn.split(':').collect();
-    if parts.len() >= 4 {
-        format!("{}:{}:{}:****", parts[0], parts[1], parts[2])
+    if let Ok((host, port, creds)) = crate::conn::parse_conn(conn) {
+        if !creds.is_empty() {
+            let parts: Vec<&str> = creds.split(':').collect();
+            if parts.len() >= 2 {
+                let user = parts[0];
+                if host.contains(':') {
+                    format!("[{}]:{}:{}:****", host, port, user)
+                } else {
+                    format!("{}:{}:{}:****", host, port, user)
+                }
+            } else {
+                conn.to_string()
+            }
+        } else {
+            conn.to_string()
+        }
     } else {
         conn.to_string()
     }
@@ -332,5 +363,33 @@ mod tests {
     fn mask_hides_only_the_password() {
         assert_eq!(mask("host:5000:user:secret"), "host:5000:user:****");
         assert_eq!(mask("host:5000"), "host:5000"); // nothing to hide
+        assert_eq!(
+            mask("[::1]:5000:user:secret"),
+            "[::1]:5000:user:****"
+        );
+    }
+
+    #[test]
+    fn multi_hop_alias_resolution() {
+        let mut servers = HashMap::new();
+        servers.insert("default".into(), "dev".into());
+        servers.insert("dev".into(), "remote".into());
+        servers.insert("remote".into(), "cluster:5000".into());
+
+        assert_eq!(
+            resolve_alias("default", &servers).unwrap(),
+            "cluster:5000"
+        );
+        assert_eq!(resolve_alias("dev", &servers).unwrap(), "cluster:5000");
+    }
+
+    #[test]
+    fn alias_cycle_detection() {
+        let mut servers = HashMap::new();
+        servers.insert("a".into(), "b".into());
+        servers.insert("b".into(), "c".into());
+        servers.insert("c".into(), "a".into());
+
+        assert!(resolve_alias("a", &servers).is_err());
     }
 }

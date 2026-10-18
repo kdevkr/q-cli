@@ -33,7 +33,7 @@ pub fn scalar_to_string(k: &K) -> String {
         K::Long(v) => if *v == NULL_LONG { "0N".into() } else { v.to_string() },
         K::Real(v) => fmt_float(*v as f64),
         K::Float(v) => fmt_float(*v),
-        K::Char(c) => (*c as char).to_string(),
+        K::Char(c) => c.to_string(),
         K::Symbol(s) => if s.is_empty() { "`".into() } else { s.clone() },
         K::Timestamp(v) => fmt_timestamp(*v),
         K::Month(v) => fmt_month(*v),
@@ -65,7 +65,7 @@ pub fn scalar_to_string(k: &K) -> String {
         // nested table/dict in a scalar slot -> compact summary (no recursion)
         K::Table(_) => format!("(table: {} rows)", table_rows(k).unwrap_or(0)),
         K::Dict(_, _) => "(dict)".into(),
-        other => compact_vec(other),
+        other => compact_vec(other, 0),
     }
 }
 
@@ -83,21 +83,39 @@ fn scalar_to_csv(k: &K) -> String {
     }
 }
 
-/// Compact one-line form for a vector (used inside lists / nested cells).
-fn compact_vec(k: &K) -> String {
+/// Compact one-line form for a vector (used inside lists / nested cells / vector rendering).
+fn compact_vec(k: &K, max: usize) -> String {
     match k {
         K::CharV(s) => format!("\"{}\"", s),
-        K::SymbolV(v) => v.iter().map(|s| format!("`{}", s)).collect::<String>(),
+        K::SymbolV(v) => {
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let mut s = v[..shown].iter().map(|s| format!("`{}", s)).collect::<String>();
+            if shown < n {
+                s.push_str("...");
+            }
+            s
+        }
         K::List(v) => {
-            let inner = v.iter().map(scalar_to_string).collect::<Vec<_>>().join(";");
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let mut inner = v[..shown].iter().map(scalar_to_string).collect::<Vec<_>>().join(";");
+            if shown < n {
+                inner.push_str(";...");
+            }
             format!("({})", inner)
         }
         _ => {
             let n = len_of(k);
-            (0..n)
+            let shown = if max == 0 { n } else { n.min(max) };
+            let mut items = (0..shown)
                 .map(|i| scalar_to_string(&at(k, i)))
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" ");
+            if shown < n {
+                items.push_str(" ...");
+            }
+            items
         }
     }
 }
@@ -155,8 +173,10 @@ pub fn to_text(k: &K, max: usize) -> String {
         K::Dict(keys, vals) => render_dict(keys, vals, max),
         K::CharV(s) => s.clone(),
         K::List(v) => {
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
             let mut parts = Vec::new();
-            for item in v {
+            for item in &v[..shown] {
                 if table_parts(item).is_some() || matches!(item, K::Dict(_, _)) {
                     for l in to_text(item, max).lines() {
                         parts.push(format!("  {}", l));
@@ -165,12 +185,15 @@ pub fn to_text(k: &K, max: usize) -> String {
                     parts.push(scalar_to_string(item));
                 }
             }
+            if shown < n {
+                parts.push(format!("  ... ({} more items)", n - shown));
+            }
             parts.join("\n")
         }
         K::Null => "::".into(),
         atom_or_vec => {
             if len_of(atom_or_vec) > 1 {
-                compact_vec(atom_or_vec)
+                compact_vec(atom_or_vec, max)
             } else {
                 scalar_to_string(atom_or_vec)
             }
@@ -299,7 +322,7 @@ pub fn to_json(k: &K, max: usize) -> String {
     if let Some((names, cols)) = table_parts(k) {
         return json_rows(&names, &cols, max);
     }
-    json_frag(k)
+    json_frag(k, max)
 }
 
 fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
@@ -316,7 +339,7 @@ fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
             }
             out.push_str(&json_string(name));
             out.push(':');
-            out.push_str(&json_frag(&at(&cols[ci], i)));
+            out.push_str(&json_frag(&at(&cols[ci], i), 0));
         }
         out.push('}');
     }
@@ -324,7 +347,7 @@ fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
     out
 }
 
-fn json_frag(k: &K) -> String {
+fn json_frag(k: &K, max: usize) -> String {
     match k {
         K::Bool(b) => (if *b { "true" } else { "false" }).into(),
         K::Byte(x) => x.to_string(),
@@ -333,7 +356,7 @@ fn json_frag(k: &K) -> String {
         K::Long(v) => num_or_null(*v == NULL_LONG, *v),
         K::Real(v) => float_json(*v as f64),
         K::Float(v) => float_json(*v),
-        K::Char(c) => json_string(&(*c as char).to_string()),
+        K::Char(c) => json_string(&c.to_string()),
         K::Symbol(s) => json_string(s),
         K::Timestamp(v) => json_string(&fmt_timestamp(*v)),
         K::Month(v) => json_string(&fmt_month(*v)),
@@ -346,17 +369,21 @@ fn json_frag(k: &K) -> String {
         K::Guid(g) => json_string(&fmt_guid(g)),
         K::CharV(s) => json_string(s),
         K::SymbolV(v) => {
-            let items: Vec<String> = v.iter().map(|s| json_string(s)).collect();
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let items: Vec<String> = v[..shown].iter().map(|s| json_string(s)).collect();
             format!("[{}]", items.join(","))
         }
         K::List(v) => {
-            let items: Vec<String> = v.iter().map(json_frag).collect();
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let items: Vec<String> = v[..shown].iter().map(|item| json_frag(item, max)).collect();
             format!("[{}]", items.join(","))
         }
-        K::Dict(keys, vals) => json_dict(keys, vals),
+        K::Dict(keys, vals) => json_dict(keys, vals, max),
         K::Table(_) => {
             if let Some((names, cols)) = table_parts(k) {
-                json_rows(&names, &cols, 0)
+                json_rows(&names, &cols, max)
             } else {
                 "null".into()
             }
@@ -366,23 +393,25 @@ fn json_frag(k: &K) -> String {
         K::Projection(_) => json_string(&scalar_to_string(k)),
         other => {
             let n = len_of(other);
-            let items: Vec<String> = (0..n).map(|i| json_frag(&at(other, i))).collect();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let items: Vec<String> = (0..shown).map(|i| json_frag(&at(other, i), max)).collect();
             format!("[{}]", items.join(","))
         }
     }
 }
 
-fn json_dict(keys: &K, vals: &K) -> String {
+fn json_dict(keys: &K, vals: &K, max: usize) -> String {
     if let K::SymbolV(names) = keys {
         let n = names.len();
+        let shown = if max == 0 { n } else { n.min(max) };
         let mut out = String::from("{");
-        for i in 0..n {
+        for i in 0..shown {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&json_string(&names[i]));
             out.push(':');
-            out.push_str(&json_frag(&at(vals, i)));
+            out.push_str(&json_frag(&at(vals, i), max));
         }
         out.push('}');
         out
@@ -390,14 +419,14 @@ fn json_dict(keys: &K, vals: &K) -> String {
         if let Some((names, cols)) =
             table_parts(&K::Dict(Box::new(keys.clone()), Box::new(vals.clone())))
         {
-            return json_rows(&names, &cols, 0);
+            return json_rows(&names, &cols, max);
         }
         "null".into()
     } else {
         format!(
             "{{\"keys\":{},\"values\":{}}}",
-            json_frag(keys),
-            json_frag(vals)
+            json_frag(keys, max),
+            json_frag(vals, max)
         )
     }
 }
@@ -524,7 +553,24 @@ mod tests {
 
     #[test]
     fn json_floats_nonfinite_are_null() {
-        assert_eq!(json_frag(&K::Float(f64::NAN)), "null");
-        assert_eq!(json_frag(&K::Float(1.5)), "1.5");
+        assert_eq!(json_frag(&K::Float(f64::NAN), 0), "null");
+        assert_eq!(json_frag(&K::Float(1.5), 0), "1.5");
+    }
+
+    #[test]
+    fn render_vector_max_rows_truncation() {
+        let v = K::LongV((0..100).collect());
+        let text = to_text(&v, 5);
+        assert!(text.ends_with("..."));
+
+        let json = to_json(&v, 5);
+        assert_eq!(json, "[0,1,2,3,4]");
+    }
+
+    #[test]
+    fn render_unicode_char_and_multibyte() {
+        let c = K::Char('한');
+        assert_eq!(scalar_to_string(&c), "한");
+        assert_eq!(json_frag(&c, 0), "\"한\"");
     }
 }
