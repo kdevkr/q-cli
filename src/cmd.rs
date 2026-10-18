@@ -858,8 +858,8 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
 
     let clean = strip_q_code(expr);
 
-    // Reject system backslash commands (e.g. \rm, \cd, \p, etc.)
-    for stmt in clean.split(';') {
+    // Reject system backslash commands (e.g. \rm, \cd, \p, etc.) across statements or lines
+    for stmt in clean.split(|c| c == ';' || c == '\n' || c == '\r') {
         let t = stmt.trim();
         if t.starts_with('\\') {
             return Err(E::usage(
@@ -1173,6 +1173,8 @@ ignored after eof
         assert!(ro("\"lib.so\" 2: (\"f\"; 1)", &ro_opts()).is_err());
         assert!(ro("\\rm -rf /", &ro_opts()).is_err());
         assert!(ro("1+1; \\cd /", &ro_opts()).is_err());
+        assert!(ro("1+1\n\\rm -rf /", &ro_opts()).is_err());
+        assert!(ro("select from t\n\\p 5000", &ro_opts()).is_err());
         assert!(ro("get \"delete from t\"", &ro_opts()).is_err());
         assert!(ro("eval (insert; `t; 1)", &ro_opts()).is_err());
     }

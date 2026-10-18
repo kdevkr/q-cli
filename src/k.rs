@@ -57,6 +57,11 @@ pub const NULL_LONG: i64 = i64::MIN;
 
 pub const MAX_READ_DEPTH: usize = 128;
 
+#[inline]
+fn safe_cap(n: usize) -> usize {
+    n.min(65536)
+}
+
 /// Cursor over a response payload.
 pub struct Reader<'a> {
     buf: &'a [u8],
@@ -194,7 +199,7 @@ impl<'a> Reader<'a> {
             // ---- vectors ----
             0 => {
                 let n = self.vhdr(1)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.read()?);
                 }
@@ -202,7 +207,7 @@ impl<'a> Reader<'a> {
             }
             1 => {
                 let n = self.vhdr(1)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.u8()? != 0);
                 }
@@ -210,7 +215,7 @@ impl<'a> Reader<'a> {
             }
             2 => {
                 let n = self.vhdr(16)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.guid()?);
                 }
@@ -222,7 +227,7 @@ impl<'a> Reader<'a> {
             }
             5 => {
                 let n = self.vhdr(2)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i16()?);
                 }
@@ -230,7 +235,7 @@ impl<'a> Reader<'a> {
             }
             6 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -238,7 +243,7 @@ impl<'a> Reader<'a> {
             }
             7 => {
                 let n = self.vhdr(8)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i64()?);
                 }
@@ -246,7 +251,7 @@ impl<'a> Reader<'a> {
             }
             8 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.f32()?);
                 }
@@ -254,7 +259,7 @@ impl<'a> Reader<'a> {
             }
             9 => {
                 let n = self.vhdr(8)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.f64()?);
                 }
@@ -267,7 +272,7 @@ impl<'a> Reader<'a> {
             }
             11 => {
                 let n = self.vhdr(1)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.sym()?);
                 }
@@ -275,7 +280,7 @@ impl<'a> Reader<'a> {
             }
             12 => {
                 let n = self.vhdr(8)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i64()?);
                 }
@@ -283,7 +288,7 @@ impl<'a> Reader<'a> {
             }
             13 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -291,7 +296,7 @@ impl<'a> Reader<'a> {
             }
             14 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -299,7 +304,7 @@ impl<'a> Reader<'a> {
             }
             15 => {
                 let n = self.vhdr(8)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.f64()?);
                 }
@@ -307,7 +312,7 @@ impl<'a> Reader<'a> {
             }
             16 => {
                 let n = self.vhdr(8)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i64()?);
                 }
@@ -315,7 +320,7 @@ impl<'a> Reader<'a> {
             }
             17 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -323,7 +328,7 @@ impl<'a> Reader<'a> {
             }
             18 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -331,7 +336,7 @@ impl<'a> Reader<'a> {
             }
             19 => {
                 let n = self.vhdr(4)?;
-                let mut v = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(safe_cap(n));
                 for _ in 0..n {
                     v.push(self.i32()?);
                 }
@@ -374,7 +379,7 @@ impl<'a> Reader<'a> {
                 if n < 0 || (n as usize) > self.buf.len().saturating_sub(self.pos) {
                     return Err("invalid projection length".to_string());
                 }
-                let mut v = Vec::with_capacity(n as usize);
+                let mut v = Vec::with_capacity(safe_cap(n as usize));
                 for _ in 0..n {
                     v.push(self.read()?);
                 }
@@ -385,7 +390,7 @@ impl<'a> Reader<'a> {
                 if n < 0 || (n as usize) > self.buf.len().saturating_sub(self.pos) {
                     return Err("invalid composition length".to_string());
                 }
-                let mut v = Vec::with_capacity(n as usize);
+                let mut v = Vec::with_capacity(safe_cap(n as usize));
                 for _ in 0..n {
                     v.push(self.read()?);
                 }
@@ -774,6 +779,9 @@ pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
                 return Err("decompress overrun (back-reference)".to_string());
             }
             let mut r = aa[src[d] as usize]; // copy source: a pointer back into dst
+            if r >= s {
+                return Err("decompress invalid back-reference before written offset".to_string());
+            }
             let mut remaining = src[d + 1] as usize + 2; // 2 + extra length
             d += 2;
             while remaining > 0 {
@@ -858,6 +866,16 @@ mod tests {
         let src = [100u8, 0, 0, 0, 0x01, 5]; // control bit set but no ref bytes
         assert!(decompress(&src, true).is_err());
         assert!(decompress(&[1u8], true).is_err()); // too short for the size word
+    }
+
+    #[test]
+    fn decompress_invalid_backreference_before_written_offset_is_err() {
+        // [usize_total=12 (=8 header + 4 data)][control 0x01 (back-ref first)][src[d]=0, src[d+1]=0]
+        // At start s=0, aa[0]=0, so r=0 >= s(0), which must be rejected.
+        let src = [12u8, 0, 0, 0, 0x01, 0, 0];
+        let res = decompress(&src, true);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("invalid back-reference"));
     }
 
     #[test]

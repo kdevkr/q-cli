@@ -102,6 +102,10 @@ fn real_main() -> i32 {
                     return 2;
                 }
             },
+            s if s.starts_with('-') && s != "-" => {
+                eprintln!("ERR unrecognized option '{}'", s);
+                return 2;
+            }
             _ => pos.push(args[i].clone()),
         }
         i += 1;
