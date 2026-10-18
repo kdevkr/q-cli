@@ -53,6 +53,7 @@ fn real_main() -> i32 {
     let mut scoped = false;
     let mut atomic = false;
     let mut dry_run = false;
+    let mut project = false;
     // default query wait: 30s, overridable per-call (--timeout) or via env.
     let mut timeout_ms: u64 = std::env::var("Q_CLI_TIMEOUT")
         .ok()
@@ -80,6 +81,7 @@ fn real_main() -> i32 {
             "--scoped" => scoped = true,
             "--atomic" => atomic = true,
             "--dry-run" => dry_run = true,
+            "--project" | "-p" => project = true,
             "--max-rows" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -125,6 +127,8 @@ fn real_main() -> i32 {
             s if s.starts_with('-') && s != "-" => {
                 if pos.len() >= 2 && matches!(pos[0].as_str(), "query" | "time") {
                     pos.push(args[i].clone());
+                } else if pos.first().map(|s| s.as_str()) == Some("config") {
+                    pos.push(args[i].clone());
                 } else {
                     eprintln!("ERR unrecognized option '{}'", s);
                     return 2;
@@ -133,6 +137,17 @@ fn real_main() -> i32 {
             _ => pos.push(args[i].clone()),
         }
         i += 1;
+    }
+
+    if project {
+        if pos.first().map(|s| s.as_str()) == Some("config") {
+            if !pos.iter().any(|a| a == "--project" || a == "-p") {
+                pos.push("--project".to_string());
+            }
+        } else {
+            eprintln!("ERR unrecognized option '--project'");
+            return 2;
+        }
     }
     let opts = Opts {
         out,

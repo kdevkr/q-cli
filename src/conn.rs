@@ -192,7 +192,7 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), E> {
                 conn
             )));
         }
-        let host = parts[0];
+        let host = if parts[0].is_empty() { "localhost" } else { parts[0] };
         let port: u16 = parts[1]
             .parse()
             .map_err(|_| E::usage(format!("bad port '{}'", parts[1])))?;
@@ -287,6 +287,11 @@ mod tests {
     #[test]
     fn parse_conn_ipv4_and_hostname() {
         let (host, port, creds) = parse_conn("localhost:5000").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+
+        let (host, port, creds) = parse_conn(":5000").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5000);
         assert_eq!(creds, "");

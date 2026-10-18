@@ -1003,7 +1003,8 @@ fn need_table(t: &str) -> Result<&str, E> {
     let rest_ok = t
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
-    if first_ok && rest_ok {
+    let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
+    if first_ok && rest_ok && has_alpha {
         Ok(t)
     } else {
         Err(E::usage(format!(
@@ -1108,6 +1109,9 @@ mod tests {
         assert!(need_table("foo bar").is_err());
         assert!(need_table("").is_err());
         assert!(need_table("1trade").is_err()); // must not start with a digit
+        assert!(need_table(".").is_err()); // cannot be only dots
+        assert!(need_table("..").is_err());
+        assert!(need_table("._.").is_err());
     }
 
     #[test]
