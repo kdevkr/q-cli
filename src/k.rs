@@ -144,7 +144,10 @@ impl<'a> Reader<'a> {
 
     /// vector header: attribute byte + i32 length, bounded by remaining buffer.
     fn vhdr(&mut self, elem_size: usize) -> Result<usize, String> {
-        let _attr = self.u8()?;
+        let attr = self.u8()?;
+        if attr > 4 {
+            return Err(format!("invalid vector attribute byte 0x{:02x} (expected 0..=4)", attr));
+        }
         let n = self.i32()?;
         if n < 0 {
             return Err("negative vector length".to_string());
@@ -344,7 +347,10 @@ impl<'a> Reader<'a> {
             }
             // ---- compound ----
             98 => {
-                let _attr = self.u8()?;
+                let attr = self.u8()?;
+                if attr > 4 {
+                    return Err(format!("invalid table attribute byte 0x{:02x} (expected 0..=4)", attr));
+                }
                 let dict = self.read()?;
                 Ok(K::Table(Box::new(dict)))
             }
@@ -903,6 +909,17 @@ mod tests {
         buf.extend_from_slice(&i32::MAX.to_le_bytes());
         buf.extend_from_slice(&[1, 0, 1, 0]);
         assert!(Reader::new(&buf, true).read().is_err());
+    }
+
+    #[test]
+    fn vhdr_invalid_attribute_returns_err() {
+        // Type 1 (bool vector): type=1, invalid attr=99, count=1, payload=[1]
+        let mut buf = vec![1u8, 99u8];
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.push(1u8);
+        let err = Reader::new(&buf, true).read();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("invalid vector attribute byte 0x63"));
     }
 
     #[test]

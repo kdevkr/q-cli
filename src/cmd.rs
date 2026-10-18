@@ -591,22 +591,21 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
         .collect::<Vec<_>>()
         .join(";\n");
 
-    // Dry-run mode: Execute inside an isolated sandbox lambda {[] ... }[]
-    // Catches all syntax and runtime errors without mutating any global server state!
+    // Dry-run mode: Validate syntax on the server using q `parse` with zero side effects.
+    // Even if the script contains mutating operations (insert, delete, set, ::),
+    // `parse` parses and checks syntax without executing any statements against the database.
     if opts.dry_run {
-        let sandbox = format!("{{[]\n{}\n}}[]", joined_stmts);
-        let probe = format!("@[value; \"{}\"; {{'x}}]", q_escape(&sandbox));
-        match c.sync(&probe) {
-            Ok(_) => {
-                return Ok(format!(
-                    "dry-run: passed ({} statements validated, syntax and runtime sandbox OK)",
-                    stmts.len()
-                ));
-            }
-            Err(e) => {
-                return Err(E::query(format!("dry-run failed: {}", e.msg)));
+        for s in &stmts {
+            let prepared = prepare_stmt_for_block(&s.text);
+            let probe = format!("@[parse; \"{}\"; {{'x}}]", q_escape(&prepared));
+            if let Err(e) = c.sync(&probe) {
+                return Err(E::query(format!("dry-run failed on line {}: {}", s.line_no, e.msg)));
             }
         }
+        return Ok(format!(
+            "dry-run: passed ({} statements validated on server with parse, zero mutations)",
+            stmts.len()
+        ));
     }
 
     // Atomic mode: Send the entire script as a single protected IPC evaluation

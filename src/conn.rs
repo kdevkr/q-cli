@@ -131,12 +131,7 @@ impl Conn {
         self.stream
             .read_exact(&mut hdr)
             .map_err(|e| io_err("no response header", &e))?;
-        if hdr[2] > 1 {
-            return Err(E::connect(format!(
-                "unsupported compression flag 0x{:02x} in response header",
-                hdr[2]
-            )));
-        }
+        validate_ipc_header(&hdr)?;
         let le = hdr[0] == 1;
         let compressed = hdr[2] == 1;
         let len = if le {
@@ -210,8 +205,30 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), E> {
     }
 }
 
+pub fn validate_ipc_header(hdr: &[u8; 8]) -> Result<(), E> {
+    if hdr[0] > 1 {
+        return Err(E::connect(format!(
+            "invalid endian byte 0x{:02x} in response header (expected 0x00 or 0x01)",
+            hdr[0]
+        )));
+    }
+    if hdr[1] != 2 {
+        return Err(E::connect(format!(
+            "unexpected message type 0x{:02x} in response header (expected 0x02 sync response)",
+            hdr[1]
+        )));
+    }
+    if hdr[2] > 1 {
+        return Err(E::connect(format!(
+            "unsupported compression flag 0x{:02x} in response header (expected 0x00 or 0x01)",
+            hdr[2]
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_handshake_capability(cap: u8) -> Result<(), E> {
-    if cap > 5 {
+    if cap > 6 {
         let hint = if cap.is_ascii_graphic() {
             format!(" '{}'", cap as char)
         } else {
@@ -230,10 +247,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ipc_header_validation() {
+        // Valid little-endian sync response, uncompressed
+        let valid_le = [1u8, 2, 0, 0, 8, 0, 0, 0];
+        assert!(validate_ipc_header(&valid_le).is_ok());
+
+        // Valid big-endian sync response, compressed
+        let valid_be = [0u8, 2, 1, 0, 0, 0, 0, 8];
+        assert!(validate_ipc_header(&valid_be).is_ok());
+
+        // Invalid endian
+        let invalid_endian = [2u8, 2, 0, 0, 8, 0, 0, 0];
+        assert!(validate_ipc_header(&invalid_endian).is_err());
+
+        // Async message (0) instead of sync response (2)
+        let async_msg = [1u8, 0, 0, 0, 8, 0, 0, 0];
+        assert!(validate_ipc_header(&async_msg).is_err());
+
+        // Invalid compression flag (2)
+        let invalid_comp = [1u8, 2, 2, 0, 8, 0, 0, 0];
+        assert!(validate_ipc_header(&invalid_comp).is_err());
+    }
+
+    #[test]
     fn capability_byte_validation() {
         assert!(validate_handshake_capability(0).is_ok());
         assert!(validate_handshake_capability(3).is_ok());
         assert!(validate_handshake_capability(5).is_ok());
+        assert!(validate_handshake_capability(6).is_ok());
 
         let err_http = validate_handshake_capability(b'H').unwrap_err();
         assert!(err_http.msg.contains("0x48 'H'"));
