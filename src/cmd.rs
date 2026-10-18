@@ -314,27 +314,51 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
 
             match c {
                 '{' | '(' | '[' => delimiter_stack.push((c, line_no)),
-                '}' => {
-                    if let Some(&(top, _)) = delimiter_stack.last() {
-                        if top == '{' {
-                            delimiter_stack.pop();
-                        }
+                '}' => match delimiter_stack.pop() {
+                    Some(('{', _)) => {}
+                    Some((top, start)) => {
+                        return Err(E::usage(format!(
+                            "syntax error: mismatched closing '}}' on line {}, expected closing for '{}' opened on line {}",
+                            line_no, top, start
+                        )));
                     }
-                }
-                ')' => {
-                    if let Some(&(top, _)) = delimiter_stack.last() {
-                        if top == '(' {
-                            delimiter_stack.pop();
-                        }
+                    None => {
+                        return Err(E::usage(format!(
+                            "syntax error: unexpected closing '}}' on line {}",
+                            line_no
+                        )));
                     }
-                }
-                ']' => {
-                    if let Some(&(top, _)) = delimiter_stack.last() {
-                        if top == '[' {
-                            delimiter_stack.pop();
-                        }
+                },
+                ')' => match delimiter_stack.pop() {
+                    Some(('(', _)) => {}
+                    Some((top, start)) => {
+                        return Err(E::usage(format!(
+                            "syntax error: mismatched closing ')' on line {}, expected closing for '{}' opened on line {}",
+                            line_no, top, start
+                        )));
                     }
-                }
+                    None => {
+                        return Err(E::usage(format!(
+                            "syntax error: unexpected closing ')' on line {}",
+                            line_no
+                        )));
+                    }
+                },
+                ']' => match delimiter_stack.pop() {
+                    Some(('[', _)) => {}
+                    Some((top, start)) => {
+                        return Err(E::usage(format!(
+                            "syntax error: mismatched closing ']' on line {}, expected closing for '{}' opened on line {}",
+                            line_no, top, start
+                        )));
+                    }
+                    None => {
+                        return Err(E::usage(format!(
+                            "syntax error: unexpected closing ']' on line {}",
+                            line_no
+                        )));
+                    }
+                },
                 _ => {}
             }
 
@@ -628,10 +652,11 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
     let mut last_k = K::Null;
     for (idx, s) in stmts.iter().enumerate() {
         let is_last = idx + 1 == stmts.len();
+        let prepared = prepare_stmt_for_block(&s.text);
         let to_send = if opts.scoped {
-            format!("{{[]\n{}\n}}[]", prepare_stmt_for_block(&s.text))
+            format!("{{[]\n{}\n}}[]", prepared)
         } else {
-            s.text.clone()
+            prepared
         };
         let to_send = if is_last && opts.out == OutMode::Console {
             format!(".Q.s value \"{}\"", q_escape(&to_send))
@@ -1177,6 +1202,12 @@ ignored after eof
 
         let unclosed_str = "s:\"hello";
         assert!(split_q_script(unclosed_str).is_err());
+
+        let mismatched = "f:{[x] (1+2]}";
+        assert!(split_q_script(mismatched).is_err());
+
+        let unexpected_close = "1+2)";
+        assert!(split_q_script(unexpected_close).is_err());
     }
 
     #[test]
