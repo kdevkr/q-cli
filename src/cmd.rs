@@ -60,6 +60,8 @@ pub const CMDS: &[Cmd] = &[
           spec: Spec::Run },
     Cmd { name: "tables", help: "<conn>                     list tables",
           spec: Spec::Eval { build: |_| Ok("tables[]".to_string()), guard: false } },
+    Cmd { name: "views", help: "<conn>                      list views",
+          spec: Spec::Eval { build: |_| Ok("views[]".to_string()), guard: false } },
     Cmd { name: "meta", help: "<conn> <table>             column schema",
           spec: Spec::Eval { build: |t| need_table(t).map(|t| format!("meta {}", t)), guard: false } },
     Cmd { name: "count", help: "<conn> <table>             row count",

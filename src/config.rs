@@ -304,11 +304,14 @@ fn add(target: &Path, name: &str, conn: &str) -> Result<String, String> {
     if conn.contains(':') {
         crate::conn::parse_conn(conn)
             .map_err(|e| format!("invalid connection string '{}': {}", conn, e.msg))?;
-    } else if !conn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(format!(
-            "invalid alias target '{}' (must be a valid profile name or host:port)",
-            conn
-        ));
+    } else {
+        let alias = conn.strip_prefix('@').unwrap_or(conn);
+        if alias.is_empty() || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!(
+                "invalid alias target '{}' (must be a valid profile name or host:port)",
+                conn
+            ));
+        }
     }
 
     if let Some(dir) = target.parent() {
@@ -466,6 +469,8 @@ mod tests {
         assert!(add(dummy, "good-name_1", "localhost:not_a_port").is_err());
         assert!(add(dummy, "good-name_1", "bad alias with spaces").is_err());
         assert!(add(dummy, "good-name_1", "").is_err());
+        assert!(add(dummy, "good-name_1", "@target_alias").is_ok());
+        assert!(add(dummy, "good-name_1", "target_alias").is_ok());
     }
 
     #[test]
