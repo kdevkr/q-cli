@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::conn::Conn;
 use crate::error::{E, R};
+use crate::k::K;
 use crate::query::{self, q_escape};
 use crate::{config, render};
 
@@ -21,6 +22,7 @@ pub struct Opts {
     pub out: OutMode,
     pub max_rows: usize, // 0 = unlimited
     pub readonly: bool,
+    pub scoped: bool,
     pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
@@ -38,6 +40,8 @@ pub enum Spec {
     /// `<conn> [arg]` — build a q expression from `arg`, eval, render.
     /// `guard` runs the readonly check on the *built* expression first.
     Eval { build: fn(&str) -> R, guard: bool },
+    /// `<conn> <path.q>` — read .q file, split into statements, sequentially execute.
+    Run,
     /// `<conn>` — handshake probe; prints `pong`.
     Ping,
     /// `<action> <conn>` — map `action` to a fixed q expression (web / trace).
@@ -50,8 +54,8 @@ pub enum Spec {
 pub const CMDS: &[Cmd] = &[
     Cmd { name: "query", help: "<conn> \"<q expr>\"|-        run a q expression (- = stdin)",
           spec: Spec::Eval { build: build_query, guard: true } },
-    Cmd { name: "run", help: "<conn> <path.q>            send a .q file",
-          spec: Spec::Eval { build: build_run, guard: true } },
+    Cmd { name: "run", help: "<conn> <path.q>|-          send a .q file (- = stdin)",
+          spec: Spec::Run },
     Cmd { name: "tables", help: "<conn>                     list tables",
           spec: Spec::Eval { build: |_| Ok("tables[]".to_string()), guard: false } },
     Cmd { name: "meta", help: "<conn> <table>             column schema",
@@ -117,6 +121,14 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
             Ok(conn) => finish(do_ping(&conn, opts), opts),
             Err(e) => finish(Err(e), opts),
         },
+        Spec::Run => {
+            let conn = match resolve(pos.get(1), mode) {
+                Ok(c) => c,
+                Err(e) => return finish(Err(e), opts),
+            };
+            let path = pos.get(2).map(|s| s.as_str()).unwrap_or("");
+            finish(do_run(&conn, path, opts), opts)
+        }
         // <conn> [arg] — build a q expression, optionally guard, eval, render.
         Spec::Eval { build, guard } => {
             let conn = match resolve(pos.get(1), mode) {
@@ -163,12 +175,81 @@ fn build_query(e: &str) -> R {
     }
 }
 
-fn build_run(path: &str) -> R {
-    if path == "-" {
-        return slurp_stdin();
+#[derive(Debug, PartialEq, Clone)]
+pub struct QStatement {
+    pub line_no: usize, // 1-indexed
+    pub text: String,
+}
+
+/// Split a q script into top-level statements according to q syntax rules:
+/// - A line with non-whitespace at column 0 starts a new statement.
+/// - Indented lines (starting with space or tab) continue the current statement.
+/// - Single-line comments start with `/` at column 0.
+/// - Block comments start with `/` alone on a line and end with `\` alone on a line.
+/// - A lone `\` at column 0 stops processing (EOF marker in q scripts).
+pub fn split_q_script(src: &str) -> Vec<QStatement> {
+    let mut stmts = Vec::new();
+    let mut current_stmt: Option<(usize, Vec<&str>)> = None;
+    let mut in_block_comment = false;
+
+    let finish_stmt = |cur: &mut Option<(usize, Vec<&str>)>, stmts: &mut Vec<QStatement>| {
+        if let Some((line_no, lines)) = cur.take() {
+            let joined = lines.join("\n").trim().to_string();
+            if !joined.is_empty() {
+                stmts.push(QStatement { line_no, text: joined });
+            }
+        }
+    };
+
+    for (idx, line) in src.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_end();
+
+        if in_block_comment {
+            if trimmed == "\\" {
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        // A slash alone on a line starts a multi-line comment block
+        if trimmed == "/" {
+            in_block_comment = true;
+            finish_stmt(&mut current_stmt, &mut stmts);
+            continue;
+        }
+
+        // A backslash alone on a line ends script execution (q EOF)
+        if trimmed == "\\" {
+            finish_stmt(&mut current_stmt, &mut stmts);
+            break;
+        }
+
+        if line.starts_with('/') {
+            finish_stmt(&mut current_stmt, &mut stmts);
+            continue;
+        }
+
+        if trimmed.trim().is_empty() {
+            finish_stmt(&mut current_stmt, &mut stmts);
+            continue;
+        }
+
+        let first_char = line.chars().next().unwrap();
+        if first_char == ' ' || first_char == '\t' {
+            if let Some((_, ref mut lines)) = current_stmt {
+                lines.push(trimmed);
+            } else {
+                current_stmt = Some((line_no, vec![trimmed]));
+            }
+        } else {
+            finish_stmt(&mut current_stmt, &mut stmts);
+            current_stmt = Some((line_no, vec![trimmed]));
+        }
     }
-    std::fs::read_to_string(path)
-        .map_err(|e| E::usage(format!("cannot read file '{}': {}", path, e)))
+    finish_stmt(&mut current_stmt, &mut stmts);
+
+    stmts
 }
 
 fn build_time(expr: &str) -> R {
@@ -220,11 +301,16 @@ fn do_ping(conn: &str, opts: &Opts) -> R {
 
 fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
     let mut c = Conn::open(conn, opts.timeout)?;
-    // --console: let q render the result string (.Q.s) for max fidelity.
-    let to_send = if opts.out == OutMode::Console {
-        format!(".Q.s value \"{}\"", q_escape(expr))
+    let expr_scoped = if opts.scoped {
+        format!("{{[]\n{}\n}}[]", expr)
     } else {
         expr.to_string()
+    };
+    // --console: let q render the result string (.Q.s) for max fidelity.
+    let to_send = if opts.out == OutMode::Console {
+        format!(".Q.s value \"{}\"", q_escape(&expr_scoped))
+    } else {
+        expr_scoped
     };
     let k = c.sync(&to_send)?;
 
@@ -244,6 +330,52 @@ fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
         OutMode::Json => render::to_json(&k, opts.max_rows),
         OutMode::Csv => render::to_csv(&k),
         OutMode::Text | OutMode::Console => render::to_text(&k, opts.max_rows),
+    })
+}
+
+fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
+    let content = if path == "-" {
+        slurp_stdin()?
+    } else if path.is_empty() {
+        return Err(E::usage("usage: q-cli run <conn> <path.q>|-"));
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| E::usage(format!("cannot read file '{}': {}", path, e)))?
+    };
+
+    let stmts = split_q_script(&content);
+    if stmts.is_empty() {
+        return Ok(String::new());
+    }
+
+    if opts.readonly {
+        for s in &stmts {
+            ro(&s.text, opts)?;
+        }
+    }
+
+    let mut c = Conn::open(conn, opts.timeout)?;
+    let mut last_k = K::Null;
+    for s in &stmts {
+        let to_send = if opts.scoped {
+            format!("{{[]\n{}\n}}[]", s.text)
+        } else {
+            s.text.clone()
+        };
+        match c.sync(&to_send) {
+            Ok(k) => {
+                last_k = k;
+            }
+            Err(e) => {
+                return Err(E::query(format!("line {}: {}", s.line_no, e.msg)));
+            }
+        }
+    }
+
+    Ok(match opts.out {
+        OutMode::Json => render::to_json(&last_k, opts.max_rows),
+        OutMode::Csv => render::to_csv(&last_k),
+        OutMode::Text | OutMode::Console => render::to_text(&last_k, opts.max_rows),
     })
 }
 
@@ -329,7 +461,7 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
     }
     const DENIED: &[&str] = &[
         "delete", "update", "insert", "upsert", "set", "hdel", "hopen", "hclose", "system",
-        "exit", "dpft", "dpfts", "rename",
+        "exit", "dpft", "dpfts", "rename", "value",
     ];
     for tok in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         if DENIED.contains(&tok) {
@@ -338,6 +470,16 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
                 tok
             )));
         }
+    }
+    if lower.contains("@[") || lower.contains(".[") {
+        return Err(E::usage(
+            "readonly: blocked amend ('@[' / '.['); unset --readonly / Q_CLI_READONLY to allow".to_string(),
+        ));
+    }
+    if lower.contains(".z.") || lower.contains(".ps.") {
+        return Err(E::usage(
+            "readonly: blocked system/handler namespace mutation ('.z.' / '.ps.'); unset --readonly / Q_CLI_READONLY to allow".to_string(),
+        ));
     }
     Ok(())
 }
@@ -370,7 +512,7 @@ fn need_table(t: &str) -> Result<&str, E> {
 pub fn print_usage() {
     let mut s = String::from("q-cli — native kdb+ IPC client\n\nUSAGE:\n");
     for c in CMDS {
-        let out = matches!(c.spec, Spec::Eval { .. });
+        let out = matches!(c.spec, Spec::Eval { .. } | Spec::Run);
         s.push_str(&format!(
             "  q-cli {}{:<9} {}\n",
             if out { "[OUT] " } else { "      " },
@@ -393,6 +535,7 @@ pub fn print_usage() {
          \x20 --max-rows N    row cap for text/json (0 = unlimited)\n\
          \x20 --timeout MS    query wait in ms (default 30000; or Q_CLI_TIMEOUT)\n\
          \x20 --readonly      reject mutating q (or set Q_CLI_READONLY=1)\n\
+         \x20 --scoped        evaluate inside {[] ... }[] to isolate locals\n\
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
@@ -404,7 +547,7 @@ mod tests {
     use super::*;
 
     fn ro_opts() -> Opts {
-        Opts { out: OutMode::Text, max_rows: 0, readonly: true, timeout: None }
+        Opts { out: OutMode::Text, max_rows: 0, readonly: true, scoped: false, timeout: None }
     }
 
     #[test]
@@ -443,5 +586,41 @@ mod tests {
         assert!(need_table("foo bar").is_err());
         assert!(need_table("").is_err());
         assert!(need_table("1trade").is_err()); // must not start with a digit
+    }
+
+    #[test]
+    fn readonly_blocks_value_amend_and_namespaces() {
+        assert!(ro("value \"1+1\"", &ro_opts()).is_err());
+        assert!(ro("@[`t;`a;:;1]", &ro_opts()).is_err());
+        assert!(ro(".[t;(0;`a);:;1]", &ro_opts()).is_err());
+        assert!(ro(".z.pg:{x}", &ro_opts()).is_err());
+        assert!(ro(".ps.f:{x}", &ro_opts()).is_err());
+    }
+
+    #[test]
+    fn split_q_script_handles_functions_comments_and_multiline() {
+        let script = r#"
+/
+ignored in block comment
+\
+f:{[x]
+  a:x+1;
+  a
+ }
+/ line comment
+g:{x*2}
+h:{1}
+\
+ignored after eof
+"#;
+        let stmts = split_q_script(script);
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0].line_no, 5);
+        assert!(stmts[0].text.starts_with("f:{[x]"));
+        assert!(stmts[0].text.contains("a:x+1;"));
+        assert_eq!(stmts[1].line_no, 10);
+        assert_eq!(stmts[1].text, "g:{x*2}");
+        assert_eq!(stmts[2].line_no, 11);
+        assert_eq!(stmts[2].text, "h:{1}");
     }
 }

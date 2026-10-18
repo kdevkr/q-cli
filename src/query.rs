@@ -35,9 +35,10 @@ pub fn functions_q(ns: &str) -> String {
 }
 
 /// Wrap an expression so the server times it and returns `ms` + result `count`.
+/// Evaluated inside an isolated lambda so local `t` and `r` do not overwrite server globals.
 pub fn time_q(expr: &str) -> String {
     format!(
-        "t:.z.p;r:value\"{}\";`ms`count!(`float$(.z.p-t)%1000000;count r)",
+        "{{t:.z.p;r:value x;`ms`count!(`float$(.z.p-t)%1000000;count r)}}\"{}\"",
         q_escape(expr)
     )
 }
@@ -73,6 +74,7 @@ mod tests {
         let q = time_q("select from t");
         assert!(q.contains(".z.p")); // times the call
         assert!(q.contains("`ms`count!")); // returns ms + count, not the data
+        assert!(q.starts_with("{t:.z.p;r:value x;")); // runs in isolated lambda
         // the inner expression is embedded as an escaped string literal
         let q2 = time_q("a\"b");
         assert!(q2.contains("a\\\"b"));

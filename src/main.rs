@@ -38,6 +38,7 @@ fn real_main() -> i32 {
     let mut readonly = std::env::var("Q_CLI_READONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let mut scoped = false;
     // default query wait: 30s, overridable per-call (--timeout) or via env.
     let mut timeout_ms: u64 = std::env::var("Q_CLI_TIMEOUT")
         .ok()
@@ -54,6 +55,7 @@ fn real_main() -> i32 {
             "--csv" => out = OutMode::Csv,
             "--console" => out = OutMode::Console,
             "--readonly" => readonly = true,
+            "--scoped" => scoped = true,
             "--max-rows" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -104,6 +106,7 @@ fn real_main() -> i32 {
         out,
         max_rows,
         readonly,
+        scoped,
         // 0 = no timeout (wait forever); otherwise a finite query-round-trip wait.
         timeout: if timeout_ms == 0 {
             None

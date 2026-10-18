@@ -47,6 +47,8 @@ pub enum K {
     Dict(Box<K>, Box<K>), // keys, values
     Table(Box<K>),        // wraps the underlying Dict(SymbolV, List)
     Null,                 // (::) and friends
+    Function(String),
+    Projection(Vec<K>),
 }
 
 pub const NULL_SHORT: i16 = i16::MIN;
@@ -325,12 +327,115 @@ impl<'a> Reader<'a> {
                 self.read()
             }
             101 => {
-                let _ = self.u8()?; // unary primitive id; 0 == (::)
-                Ok(K::Null)
+                let op = self.u8()?;
+                if op == 0 {
+                    Ok(K::Null)
+                } else {
+                    Ok(K::Function(unary_op_name(op)))
+                }
+            }
+            102 => {
+                let op = self.u8()?;
+                Ok(K::Function(binary_op_name(op)))
+            }
+            103 => {
+                let op = self.u8()?;
+                Ok(K::Function(iter_name(op)))
+            }
+            104 => {
+                let n = self.i32()?;
+                let mut v = Vec::with_capacity(n.max(0) as usize);
+                for _ in 0..n {
+                    v.push(self.read()?);
+                }
+                Ok(K::Projection(v))
+            }
+            105 => {
+                let n = self.i32()?;
+                let mut v = Vec::with_capacity(n.max(0) as usize);
+                for _ in 0..n {
+                    v.push(self.read()?);
+                }
+                Ok(K::Projection(v))
+            }
+            106..=111 => {
+                let inner = self.read()?;
+                let adv = match t {
+                    106 => "'",
+                    107 => "/",
+                    108 => "\\",
+                    109 => "':",
+                    110 => "/:",
+                    111 => "\\:",
+                    _ => "",
+                };
+                match inner {
+                    K::Function(s) => Ok(K::Function(format!("{}{}", s, adv))),
+                    other => Ok(K::Projection(vec![other, K::Function(adv.to_string())])),
+                }
+            }
+            112 => {
+                let inner = self.read()?;
+                match inner {
+                    K::Function(s) => Ok(K::Function(format!("2: {}", s))),
+                    other => Ok(K::Projection(vec![K::Function("2:".to_string()), other])),
+                }
             }
             -128 => Err(format!("q error '{}", self.sym()?)),
             _ => Err(format!("unsupported q type code {}", t)),
         }
+    }
+}
+
+fn unary_op_name(op: u8) -> String {
+    match op {
+        1 => "flip".into(),
+        2 => "neg".into(),
+        3 => "first".into(),
+        4 => "where".into(),
+        5 => "reverse".into(),
+        6 => "asc".into(),
+        7 => "desc".into(),
+        8 => "group".into(),
+        9 => "not".into(),
+        10 => "distinct".into(),
+        11 => "enlist".into(),
+        12 => "null".into(),
+        13 => "count".into(),
+        14 => "floor".into(),
+        15 => "string".into(),
+        _ => format!("unary#{}", op),
+    }
+}
+
+fn binary_op_name(op: u8) -> String {
+    match op {
+        0 => ":".into(),
+        1 => "+".into(),
+        2 => "-".into(),
+        3 => "*".into(),
+        4 => "%".into(),
+        5 => "&".into(),
+        6 => "|".into(),
+        7 => "<".into(),
+        8 => ">".into(),
+        9 => "=".into(),
+        10 => "<>".into(),
+        11 => ">=".into(),
+        12 => "<=".into(),
+        _ => format!("op#{}", op),
+    }
+}
+
+fn iter_name(op: u8) -> String {
+    match op {
+        0 => "'".into(),
+        1 => "/".into(),
+        2 => "\\".into(),
+        3 => "':".into(),
+        4 => "/:".into(),
+        5 => "\\:".into(),
+        _ => format!("iter#{}", op),
     }
 }
 

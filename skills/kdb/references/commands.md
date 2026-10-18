@@ -27,7 +27,7 @@ q-cli       --version | -V | --help | -h
 ## Commands
 
 - **`query`** → run a q expression, print result. **`run`** → send a `.q` file
-  (single expression / `;`-separated; multi-statement scripts: load on server).
+  (splits into top-level statements by q rules, sequentially executed with line-number error reporting).
   Both accept `-` as the argument to read the q source from **stdin** (pipe a
   generated or multi-line expression).
 - **`ping`** → `pong` if the handshake succeeds.
@@ -93,6 +93,7 @@ First-time setup:
   server-mutating `web off`/`web get-ok` / `trace on`/`trace off` (their `status`
   forms stay allowed). Heuristic, not a sandbox; keywords inside a string literal
   (e.g. `… like "*delete*"`) are ignored so reads aren't false-blocked.
+- `--scoped` → evaluate expression inside `{[] ... }[]` so assignments do not pollute server globals.
 
 ## Exit codes — branch on these instead of parsing text
 

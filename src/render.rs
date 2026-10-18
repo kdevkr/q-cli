@@ -1,15 +1,21 @@
 //! Render a deserialized `K` value as readable text or as JSON.
 //! Row caps take a `max` argument; `max == 0` means unlimited.
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::k::*;
 
 // ============================================================================
 // Shared scalar formatting
 // ============================================================================
 
+fn str_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 fn fmt_float(v: f64) -> String {
     if v.is_nan() {
-        String::new()
+        "0n".into()
     } else if v.is_infinite() {
         if v > 0.0 { "0w".into() } else { "-0w".into() }
     } else {
@@ -17,18 +23,18 @@ fn fmt_float(v: f64) -> String {
     }
 }
 
-/// Plain string for a single scalar (also used for table cells).
+/// Plain string for a single scalar (also used for table cells in text mode).
 pub fn scalar_to_string(k: &K) -> String {
     match k {
         K::Bool(b) => (if *b { "1" } else { "0" }).into(),
         K::Byte(x) => format!("0x{:02x}", x),
-        K::Short(v) => if *v == NULL_SHORT { String::new() } else { v.to_string() },
-        K::Int(v) => if *v == NULL_INT { String::new() } else { v.to_string() },
-        K::Long(v) => if *v == NULL_LONG { String::new() } else { v.to_string() },
+        K::Short(v) => if *v == NULL_SHORT { "0N".into() } else { v.to_string() },
+        K::Int(v) => if *v == NULL_INT { "0N".into() } else { v.to_string() },
+        K::Long(v) => if *v == NULL_LONG { "0N".into() } else { v.to_string() },
         K::Real(v) => fmt_float(*v as f64),
         K::Float(v) => fmt_float(*v),
         K::Char(c) => (*c as char).to_string(),
-        K::Symbol(s) => s.clone(),
+        K::Symbol(s) => if s.is_empty() { "`".into() } else { s.clone() },
         K::Timestamp(v) => fmt_timestamp(*v),
         K::Month(v) => fmt_month(*v),
         K::Date(v) => fmt_date(*v),
@@ -38,11 +44,42 @@ pub fn scalar_to_string(k: &K) -> String {
         K::Second(v) => fmt_second(*v),
         K::Time(v) => fmt_time(*v),
         K::Guid(g) => fmt_guid(g),
-        K::Null => String::new(),
+        K::Null => "::".into(),
+        K::Function(s) => s.clone(),
+        K::Projection(v) => {
+            if v.is_empty() {
+                "{}".to_string()
+            } else {
+                let f = scalar_to_string(&v[0]);
+                let args = v[1..]
+                    .iter()
+                    .map(|arg| match arg {
+                        K::Null => String::new(),
+                        other => scalar_to_string(other),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                format!("{}[{}]", f, args)
+            }
+        }
         // nested table/dict in a scalar slot -> compact summary (no recursion)
         K::Table(_) => format!("(table: {} rows)", table_rows(k).unwrap_or(0)),
         K::Dict(_, _) => "(dict)".into(),
         other => compact_vec(other),
+    }
+}
+
+/// Cell string for CSV (nulls format as empty strings per CSV standard).
+fn scalar_to_csv(k: &K) -> String {
+    match k {
+        K::Short(v) if *v == NULL_SHORT => String::new(),
+        K::Int(v) if *v == NULL_INT => String::new(),
+        K::Long(v) if *v == NULL_LONG => String::new(),
+        K::Real(v) if v.is_nan() => String::new(),
+        K::Float(v) if v.is_nan() => String::new(),
+        K::Symbol(s) => s.clone(),
+        K::Null => String::new(),
+        _ => scalar_to_string(k),
     }
 }
 
@@ -117,11 +154,19 @@ pub fn to_text(k: &K, max: usize) -> String {
     match k {
         K::Dict(keys, vals) => render_dict(keys, vals, max),
         K::CharV(s) => s.clone(),
-        K::List(v) => v
-            .iter()
-            .map(scalar_to_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        K::List(v) => {
+            let mut parts = Vec::new();
+            for item in v {
+                if table_parts(item).is_some() || matches!(item, K::Dict(_, _)) {
+                    for l in to_text(item, max).lines() {
+                        parts.push(format!("  {}", l));
+                    }
+                } else {
+                    parts.push(scalar_to_string(item));
+                }
+            }
+            parts.join("\n")
+        }
         K::Null => "::".into(),
         atom_or_vec => {
             if len_of(atom_or_vec) > 1 {
@@ -137,13 +182,13 @@ fn render_table(names: &[String], cols: &[K], max: usize) -> String {
     let nrows = cols.first().map(len_of).unwrap_or(0);
     let shown = cap(nrows, max);
 
-    let mut widths: Vec<usize> = names.iter().map(|n| n.len()).collect();
+    let mut widths: Vec<usize> = names.iter().map(|n| str_width(n)).collect();
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(cols.len());
     for (ci, col) in cols.iter().enumerate() {
         let mut colcells = Vec::with_capacity(shown);
         for i in 0..shown {
             let s = scalar_to_string(&at(col, i));
-            widths[ci] = widths[ci].max(s.len());
+            widths[ci] = widths[ci].max(str_width(&s));
             colcells.push(s);
         }
         cells.push(colcells);
@@ -176,26 +221,27 @@ fn render_table(names: &[String], cols: &[K], max: usize) -> String {
 }
 
 fn pad(s: &str, w: usize) -> String {
-    if s.len() >= w {
+    let sw = str_width(s);
+    if sw >= w {
         s.to_string()
     } else {
-        format!("{}{}", s, " ".repeat(w - s.len()))
+        format!("{}{}", s, " ".repeat(w - sw))
     }
 }
 
-/// Dict as `key| value` lines; a table-valued entry is rendered as an indented
-/// sub-table block (so e.g. `describe`'s columns/sample show in full).
+/// Dict as `key| value` lines; a table-valued or dict-valued entry is rendered as an indented
+/// sub-block (so e.g. `describe`'s columns/sample and nested dicts show in full).
 fn render_dict(keys: &K, vals: &K, max: usize) -> String {
     let n = len_of(keys);
     let kw = (0..n)
-        .map(|i| scalar_to_string(&at(keys, i)).len())
+        .map(|i| str_width(&scalar_to_string(&at(keys, i))))
         .max()
         .unwrap_or(0);
     let mut lines: Vec<String> = Vec::new();
     for i in 0..n {
         let kstr = scalar_to_string(&at(keys, i));
         let v = at(vals, i);
-        if table_parts(&v).is_some() {
+        if table_parts(&v).is_some() || matches!(v, K::Dict(_, _)) {
             lines.push(format!("{}|", kstr));
             for l in to_text(&v, max).lines() {
                 lines.push(format!("  {}", l));
@@ -229,7 +275,7 @@ pub fn to_csv(k: &K) -> String {
     for i in 0..nrows {
         let row: Vec<String> = cols
             .iter()
-            .map(|c| csv_field(&scalar_to_string(&at(c, i))))
+            .map(|c| csv_field(&scalar_to_csv(&at(c, i))))
             .collect();
         out.push_str(&row.join(","));
         out.push('\n');
@@ -316,6 +362,8 @@ fn json_frag(k: &K) -> String {
             }
         }
         K::Null => "null".into(),
+        K::Function(s) => json_string(s),
+        K::Projection(_) => json_string(&scalar_to_string(k)),
         other => {
             let n = len_of(other);
             let items: Vec<String> = (0..n).map(|i| json_frag(&at(other, i))).collect();
@@ -431,10 +479,47 @@ mod tests {
 
     #[test]
     fn scalar_nulls_and_floats() {
-        assert_eq!(scalar_to_string(&K::Int(NULL_INT)), "");
+        assert_eq!(scalar_to_string(&K::Int(NULL_INT)), "0N");
+        assert_eq!(scalar_to_string(&K::Float(f64::NAN)), "0n");
+        assert_eq!(scalar_to_string(&K::Symbol("".into())), "`");
         assert_eq!(scalar_to_string(&K::Long(42)), "42");
         assert_eq!(fmt_float(f64::INFINITY), "0w");
-        assert_eq!(fmt_float(f64::NAN), "");
+        assert_eq!(fmt_float(f64::NAN), "0n");
+    }
+
+    #[test]
+    fn unicode_table_column_alignment() {
+        let table = K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["k".into(), "v".into()])),
+            Box::new(K::List(vec![
+                K::SymbolV(vec!["가나다".into(), "a".into()]),
+                K::IntV(vec![1, 2]),
+            ])),
+        )));
+        let text = to_text(&table, 0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "k      v");
+        assert_eq!(lines[1], "--------");
+        assert_eq!(lines[2], "가나다 1");
+        assert_eq!(lines[3], "a      2");
+    }
+
+    #[test]
+    fn nested_dict_renders_indented() {
+        let inner = K::Dict(
+            Box::new(K::SymbolV(vec!["x".into(), "y".into()])),
+            Box::new(K::IntV(vec![1, 2])),
+        );
+        let outer = K::Dict(
+            Box::new(K::SymbolV(vec!["a".into(), "b".into()])),
+            Box::new(K::List(vec![inner, K::Int(3)])),
+        );
+        let text = to_text(&outer, 0);
+        assert!(text.contains("a|"));
+        assert!(text.contains("  x| 1"));
+        assert!(text.contains("  y| 2"));
+        assert!(text.contains("b| 3"));
     }
 
     #[test]
