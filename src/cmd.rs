@@ -384,14 +384,15 @@ fn build_time(expr: &str) -> R {
 /// (.z.ph GET / .z.pp POST) at runtime.
 fn web_expr(action: &str) -> R {
     Ok(match action {
-        "off" => ".z.ph:{hclose .z.w};.z.pp:{hclose .z.w};\"web: off (all HTTP closed)\"",
+        "off" => ".z.ph:{hclose .z.w};.z.pp:{hclose .z.w};\"web: off (all HTTP closed)\"".to_string(),
         "get-ok" => {
-            ".z.ph:{.h.hy[`txt;\"OK\"]};.z.pp:{hclose .z.w};\"web: get-ok (GET 200, POST closed)\""
+            ".z.ph:{.h.hy[`txt;\"OK\"]};.z.pp:{hclose .z.w};\"web: get-ok (GET 200, POST closed)\"".to_string()
         }
-        "status" => "`ph`pp!(.z.ph;.z.pp)",
+        "status" => {
+            "`ph`pp!(@[{string value x};`.z.ph;\"(default)\"];@[{string value x};`.z.pp;\"(none)\"])".to_string()
+        }
         _ => return Err(E::usage("web action must be: off | get-ok | status")),
-    }
-    .to_string())
+    })
 }
 
 /// `trace <on|off|status>` — wrap .z.pg/.z.ps with .Q.trp so query errors return
@@ -655,7 +656,12 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
 fn run_on(conn_tok: Option<&String>, expr: &str, opts: &Opts) -> i32 {
     let tok = match conn_tok {
         Some(c) => c,
-        None => return finish(Err(E::usage("missing <conn>")), opts),
+        None => {
+            return finish(
+                Err(E::usage("missing <conn> (e.g. localhost:5000 or @server)")),
+                opts,
+            )
+        }
     };
     let r = config::resolve_conn(tok)
         .map_err(E::usage)

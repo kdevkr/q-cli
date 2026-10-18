@@ -33,8 +33,20 @@ fn main() {
 }
 
 fn real_main() -> i32 {
-    let mut out = OutMode::Text;
-    let mut max_rows: usize = 50;
+    let mut out = std::env::var("Q_CLI_OUT")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "json" => Some(OutMode::Json),
+            "csv" => Some(OutMode::Csv),
+            "console" => Some(OutMode::Console),
+            "text" => Some(OutMode::Text),
+            _ => None,
+        })
+        .unwrap_or(OutMode::Text);
+    let mut max_rows: usize = std::env::var("Q_CLI_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
     let mut readonly = std::env::var("Q_CLI_READONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -53,6 +65,14 @@ fn real_main() -> i32 {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
+            "--" => {
+                i += 1;
+                while i < args.len() {
+                    pos.push(args[i].clone());
+                    i += 1;
+                }
+                break;
+            }
             "--json" | "-j" => out = OutMode::Json,
             "--csv" => out = OutMode::Csv,
             "--console" => out = OutMode::Console,
@@ -103,8 +123,12 @@ fn real_main() -> i32 {
                 }
             },
             s if s.starts_with('-') && s != "-" => {
-                eprintln!("ERR unrecognized option '{}'", s);
-                return 2;
+                if pos.len() >= 2 && matches!(pos[0].as_str(), "query" | "time") {
+                    pos.push(args[i].clone());
+                } else {
+                    eprintln!("ERR unrecognized option '{}'", s);
+                    return 2;
+                }
             }
             _ => pos.push(args[i].clone()),
         }
