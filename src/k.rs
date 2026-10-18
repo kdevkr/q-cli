@@ -483,7 +483,13 @@ pub fn len_of(k: &K) -> usize {
         K::LongV(v) => v.len(),
         K::RealV(v) => v.len(),
         K::FloatV(v) => v.len(),
-        K::CharV(v) => v.chars().count(),
+        K::CharV(v) => {
+            if v.is_ascii() {
+                v.len()
+            } else {
+                v.chars().count()
+            }
+        }
         K::SymbolV(v) => v.len(),
         K::TimestampV(v) => v.len(),
         K::MonthV(v) => v.len(),
@@ -510,7 +516,13 @@ pub fn at(k: &K, i: usize) -> K {
         K::LongV(v) => v.get(i).copied().map(K::Long).unwrap_or(K::Null),
         K::RealV(v) => v.get(i).copied().map(K::Real).unwrap_or(K::Null),
         K::FloatV(v) => v.get(i).copied().map(K::Float).unwrap_or(K::Null),
-        K::CharV(v) => v.chars().nth(i).map(K::Char).unwrap_or(K::Null),
+        K::CharV(v) => {
+            if v.is_ascii() {
+                v.as_bytes().get(i).copied().map(|b| K::Char(b as char)).unwrap_or(K::Null)
+            } else {
+                v.chars().nth(i).map(K::Char).unwrap_or(K::Null)
+            }
+        }
         K::SymbolV(v) => v.get(i).cloned().map(K::Symbol).unwrap_or(K::Null),
         K::TimestampV(v) => v.get(i).copied().map(K::Timestamp).unwrap_or(K::Null),
         K::MonthV(v) => v.get(i).copied().map(K::Month).unwrap_or(K::Null),

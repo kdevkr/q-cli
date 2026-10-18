@@ -86,7 +86,8 @@ impl Conn {
         self.stream
             .read_exact(&mut resp)
             .map_err(|_| E::connect("authentication failed (no login reply from server)"))?;
-        Ok(())
+
+        validate_handshake_capability(resp[0])
     }
 
     /// Send a q expression as a sync request and return the deserialized result.
@@ -189,9 +190,38 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), E> {
     }
 }
 
+pub fn validate_handshake_capability(cap: u8) -> Result<(), E> {
+    if cap > 5 {
+        let hint = if cap.is_ascii_graphic() {
+            format!(" '{}'", cap as char)
+        } else {
+            String::new()
+        };
+        return Err(E::connect(format!(
+            "invalid capability byte 0x{:02x}{} from server; remote port is likely not a kdb+ process",
+            cap, hint
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_byte_validation() {
+        assert!(validate_handshake_capability(0).is_ok());
+        assert!(validate_handshake_capability(3).is_ok());
+        assert!(validate_handshake_capability(5).is_ok());
+
+        let err_http = validate_handshake_capability(b'H').unwrap_err();
+        assert!(err_http.msg.contains("0x48 'H'"));
+        assert!(err_http.msg.contains("remote port is likely not a kdb+ process"));
+
+        let err_ssh = validate_handshake_capability(b'S').unwrap_err();
+        assert!(err_ssh.msg.contains("0x53 'S'"));
+    }
 
     #[test]
     fn parse_conn_ipv4_and_hostname() {

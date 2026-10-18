@@ -83,6 +83,13 @@ fn scalar_to_csv(k: &K) -> String {
     }
 }
 
+fn scalar_sym_aware(k: &K) -> String {
+    match k {
+        K::Symbol(s) => format!("`{}", s),
+        _ => scalar_to_string(k),
+    }
+}
+
 /// Compact one-line form for a vector (used inside lists / nested cells / vector rendering).
 fn compact_vec(k: &K, max: usize) -> String {
     match k {
@@ -99,7 +106,7 @@ fn compact_vec(k: &K, max: usize) -> String {
         K::List(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
-            let mut inner = v[..shown].iter().map(scalar_to_string).collect::<Vec<_>>().join(";");
+            let mut inner = v[..shown].iter().map(scalar_sym_aware).collect::<Vec<_>>().join(";");
             if shown < n {
                 inner.push_str(";...");
             }
@@ -182,7 +189,7 @@ pub fn to_text(k: &K, max: usize) -> String {
                         parts.push(format!("  {}", l));
                     }
                 } else {
-                    parts.push(scalar_to_string(item));
+                    parts.push(scalar_sym_aware(item));
                 }
             }
             if shown < n {
@@ -191,6 +198,7 @@ pub fn to_text(k: &K, max: usize) -> String {
             parts.join("\n")
         }
         K::Null => "::".into(),
+        K::Symbol(s) => format!("`{}", s),
         atom_or_vec => {
             if len_of(atom_or_vec) > 1 {
                 compact_vec(atom_or_vec, max)
@@ -270,7 +278,7 @@ fn render_dict(keys: &K, vals: &K, max: usize) -> String {
                 lines.push(format!("  {}", l));
             }
         } else {
-            lines.push(format!("{}| {}", pad(&kstr, kw), scalar_to_string(&v)));
+            lines.push(format!("{}| {}", pad(&kstr, kw), scalar_sym_aware(&v)));
         }
     }
     lines.join("\n")
@@ -572,5 +580,18 @@ mod tests {
         let c = K::Char('한');
         assert_eq!(scalar_to_string(&c), "한");
         assert_eq!(json_frag(&c, 0), "\"한\"");
+    }
+
+    #[test]
+    fn render_scalar_symbol_and_list_symbols() {
+        let sym = K::Symbol("trade".into());
+        assert_eq!(to_text(&sym, 0), "`trade");
+
+        let empty_sym = K::Symbol("".into());
+        assert_eq!(to_text(&empty_sym, 0), "`");
+
+        let list = K::List(vec![K::Int(1), K::Symbol("abc".into())]);
+        let text = to_text(&list, 0);
+        assert_eq!(text, "1\n`abc");
     }
 }

@@ -411,16 +411,27 @@ fn extract_candidate_func_names(expr: &str) -> Vec<String> {
     let clean = strip_q_code(expr);
     let tokens = tokenize_q_for_ro(&clean);
     let mut names = Vec::new();
+    let mut prev_is_from = false;
+
     for (i, tok) in tokens.iter().enumerate() {
         if let QTok::Ident(name) = tok {
-            let is_call = match tokens.get(i + 1) {
+            let next = tokens.get(i + 1);
+            let is_assign = matches!(
+                next,
+                Some(QTok::Colon) | Some(QTok::DoubleColon) | Some(QTok::CompoundColon(_))
+            );
+            let is_call = match next {
                 Some(QTok::OpenBracket) | Some(QTok::OpenParen) => true,
+                // Prefix function call: f x, f 10, f `trade, f {x+1}
+                Some(QTok::Ident(n)) => !prev_is_from && !is_builtin_or_keyword(n),
+                Some(QTok::Other) | Some(QTok::OpenBrace) => !prev_is_from,
                 _ => false,
             };
-            if is_call && !is_builtin_or_keyword(name) && !names.contains(name) {
+            if !is_assign && is_call && !is_builtin_or_keyword(name) && !names.contains(name) {
                 names.push(name.clone());
             }
         }
+        prev_is_from = matches!(tok, QTok::From);
     }
     names
 }
@@ -532,10 +543,16 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
         inspect_remote_funcs(&mut c, &content, 5)?;
     }
 
+    let joined_stmts = stmts
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(";\n");
+
     // Dry-run mode: Execute inside an isolated sandbox lambda {[] ... }[]
     // Catches all syntax and runtime errors without mutating any global server state!
     if opts.dry_run {
-        let sandbox = format!("{{[]\n{}\n}}[]", content);
+        let sandbox = format!("{{[]\n{}\n}}[]", joined_stmts);
         let probe = format!("@[value; \"{}\"; {{'x}}]", q_escape(&sandbox));
         match c.sync(&probe) {
             Ok(_) => {
@@ -553,9 +570,9 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
     // Atomic mode: Send the entire script as a single protected IPC evaluation
     if opts.atomic {
         let body = if opts.scoped {
-            format!("{{[]\n{}\n}}[]", content)
+            format!("{{[]\n{}\n}}[]", joined_stmts)
         } else {
-            content
+            joined_stmts
         };
         let to_send = if opts.out == OutMode::Console {
             format!(".Q.s @[value; \"{}\"; {{'x}}]", q_escape(&body))
@@ -1181,5 +1198,8 @@ ignored after eof
 
         let f3 = extract_candidate_func_names("select count i by sym from trade");
         assert!(f3.is_empty());
+
+        let f4 = extract_candidate_func_names("cleanup 10; .ns.clean `trade; my_func arg");
+        assert_eq!(f4, vec!["cleanup", ".ns.clean", "my_func"]);
     }
 }
