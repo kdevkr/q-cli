@@ -538,7 +538,7 @@ pub fn at(k: &K, i: usize) -> K {
         K::SecondV(v) => v.get(i).copied().map(K::Second).unwrap_or(K::Null),
         K::TimeV(v) => v.get(i).copied().map(K::Time).unwrap_or(K::Null),
         K::List(v) => v.get(i).cloned().unwrap_or(K::Null),
-        other => other.clone(),
+        other => if i == 0 { other.clone() } else { K::Null },
     }
 }
 
@@ -942,6 +942,11 @@ mod tests {
         assert_eq!(at(&cv, 1), K::Char('나'));
         assert_eq!(at(&cv, 2), K::Char('다'));
         assert_eq!(at(&cv, 3), K::Null);
+
+        // Scalar atoms return K::Null when index > 0
+        assert_eq!(at(&K::Long(10), 0), K::Long(10));
+        assert_eq!(at(&K::Long(10), 1), K::Null);
+        assert_eq!(at(&K::Symbol("x".into()), 1), K::Null);
     }
 
     #[test]

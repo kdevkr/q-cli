@@ -123,7 +123,15 @@ fn scalar_sym_aware(k: &K) -> String {
 /// Compact one-line form for a vector (used inside lists / nested cells / vector rendering).
 fn compact_vec(k: &K, max: usize) -> String {
     match k {
-        K::CharV(s) => format!("\"{}\"", s),
+        K::CharV(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{}\"", escaped)
+        }
         K::SymbolV(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
@@ -628,5 +636,24 @@ mod tests {
         let list = K::List(vec![K::Int(1), K::Symbol("abc".into())]);
         let text = to_text(&list, 0);
         assert_eq!(text, "1\n`abc");
+    }
+
+    #[test]
+    fn render_table_cell_with_newline_is_escaped() {
+        let table = K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["id".into(), "msg".into()])),
+            Box::new(K::List(vec![
+                K::LongV(vec![1, 2]),
+                K::List(vec![
+                    K::CharV("hello\nworld".into()),
+                    K::CharV("line1\r\nline2\ttab".into()),
+                ]),
+            ])),
+        )));
+        let text = to_text(&table, 0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[2].contains("\"hello\\nworld\""));
+        assert!(lines[3].contains("\"line1\\r\\nline2\\ttab\""));
     }
 }

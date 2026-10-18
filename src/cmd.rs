@@ -809,7 +809,7 @@ fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
             continue;
         }
 
-        if matches!(c, ',' | '+' | '-' | '*' | '%' | '&' | '|' | '^' | '_') {
+        if matches!(c, ',' | '+' | '-' | '*' | '%' | '&' | '|' | '^' | '_' | '#' | '!') {
             if i + 1 < chars.len() && chars[i + 1] == ':' {
                 tokens.push(QTok::CompoundColon(c));
                 i += 2;
@@ -916,12 +916,6 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
                 ));
             }
         }
-    }
-
-    if lower.contains(".z.") || lower.contains(".ps.") {
-        return Err(E::usage(
-            "readonly: blocked system/handler namespace mutation ('.z.' / '.ps.'); unset --readonly / Q_CLI_READONLY to allow".to_string(),
-        ));
     }
 
     // Validate assignments: ident::, ident,:, and ident: (outside select/exec projection and outside lambda local scopes)
@@ -1124,6 +1118,11 @@ mod tests {
         assert!(ro(".[t;(0;`a);:;1]", &ro_opts()).is_err());
         assert!(ro(".z.pg:{x}", &ro_opts()).is_err());
         assert!(ro(".ps.f:{x}", &ro_opts()).is_err());
+
+        // Harmless read-only .z. variables must be allowed
+        assert!(ro(".z.p", &ro_opts()).is_ok());
+        assert!(ro(".z.K", &ro_opts()).is_ok());
+        assert!(ro("select from t where date = .z.d", &ro_opts()).is_ok());
     }
 
     #[test]
@@ -1184,6 +1183,8 @@ ignored after eof
         assert!(ro("trade::1", &ro_opts()).is_err());
         assert!(ro("t,: (1; 2)", &ro_opts()).is_err());
         assert!(ro("t +: 1", &ro_opts()).is_err());
+        assert!(ro("t #: 10", &ro_opts()).is_err());
+        assert!(ro("d !: 1", &ro_opts()).is_err());
         assert!(ro("trade: select from trade", &ro_opts()).is_err());
         assert!(ro("\"lib.so\" 2: (\"f\"; 1)", &ro_opts()).is_err());
         assert!(ro("\\rm -rf /", &ro_opts()).is_err());
