@@ -2,7 +2,7 @@
 
 /// A deserialized q value. Only the types a CLI realistically encounters are
 /// modelled; anything else surfaces as an explicit error.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum K {
     // atoms
     Bool(bool),
@@ -55,16 +55,19 @@ pub const NULL_SHORT: i16 = i16::MIN;
 pub const NULL_INT: i32 = i32::MIN;
 pub const NULL_LONG: i64 = i64::MIN;
 
+pub const MAX_READ_DEPTH: usize = 128;
+
 /// Cursor over a response payload.
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     le: bool,
+    depth: usize,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8], le: bool) -> Self {
-        Reader { buf, pos: 0, le }
+        Reader { buf, pos: 0, le, depth: 0 }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
@@ -154,6 +157,19 @@ impl<'a> Reader<'a> {
 
     /// Read one K object at the cursor.
     pub fn read(&mut self) -> Result<K, String> {
+        if self.depth >= MAX_READ_DEPTH {
+            return Err(format!(
+                "max deserialization recursion depth exceeded ({})",
+                MAX_READ_DEPTH
+            ));
+        }
+        self.depth += 1;
+        let res = self.read_impl();
+        self.depth -= 1;
+        res
+    }
+
+    fn read_impl(&mut self) -> Result<K, String> {
         let t = self.i8()?;
         match t {
             // ---- atoms ----
@@ -797,5 +813,21 @@ mod tests {
         buf.extend_from_slice(&i32::MAX.to_le_bytes());
         buf.extend_from_slice(&[1, 0, 1, 0]);
         assert!(Reader::new(&buf, true).read().is_err());
+    }
+
+    #[test]
+    fn recursion_depth_limit_prevents_stack_overflow() {
+        // Construct 150 nested type 0 (generic list of 1 element)
+        let mut buf = Vec::new();
+        for _ in 0..150 {
+            buf.push(0u8); // type 0: generic list
+            buf.push(0u8); // attr
+            buf.extend_from_slice(&1i32.to_le_bytes()); // count = 1
+        }
+        buf.push(245u8); // -11 (symbol)
+        buf.push(0u8); // empty symbol `
+        let err = Reader::new(&buf, true).read();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("max deserialization recursion depth exceeded"));
     }
 }

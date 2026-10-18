@@ -39,6 +39,8 @@ fn real_main() -> i32 {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut scoped = false;
+    let mut atomic = false;
+    let mut dry_run = false;
     // default query wait: 30s, overridable per-call (--timeout) or via env.
     let mut timeout_ms: u64 = std::env::var("Q_CLI_TIMEOUT")
         .ok()
@@ -56,6 +58,8 @@ fn real_main() -> i32 {
             "--console" => out = OutMode::Console,
             "--readonly" => readonly = true,
             "--scoped" => scoped = true,
+            "--atomic" => atomic = true,
+            "--dry-run" => dry_run = true,
             "--max-rows" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -107,6 +111,8 @@ fn real_main() -> i32 {
         max_rows,
         readonly,
         scoped,
+        atomic,
+        dry_run,
         // 0 = no timeout (wait forever); otherwise a finite query-round-trip wait.
         timeout: if timeout_ms == 0 {
             None

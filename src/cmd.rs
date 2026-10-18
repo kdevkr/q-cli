@@ -23,6 +23,8 @@ pub struct Opts {
     pub max_rows: usize, // 0 = unlimited
     pub readonly: bool,
     pub scoped: bool,
+    pub atomic: bool,   // execute entire script in a single atomic block
+    pub dry_run: bool,  // simulate execution in an isolated sandbox to verify syntax and runtime without mutations
     pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
@@ -388,8 +390,106 @@ fn do_ping(conn: &str, opts: &Opts) -> R {
     Ok("pong".to_string())
 }
 
+fn is_builtin_or_keyword(name: &str) -> bool {
+    const BUILTINS: &[&str] = &[
+        "select", "exec", "update", "delete", "from", "by", "where",
+        "count", "meta", "tables", "views", "cols", "keys", "key", "value",
+        "first", "last", "sum", "avg", "min", "max", "prd", "med", "dev", "var",
+        "null", "not", "and", "or", "all", "any", "distinct", "group", "in", "like",
+        "bin", "binr", "asof", "lj", "uj", "ij", "pj", "aj", "aj0", "wj", "wj1",
+        "xbar", "xprev", "prev", "next", "prior", "mavg", "msum", "mcount",
+        "mdev", "mmin", "mmax", "ema", "deltas", "ratios", "differ",
+        "fills", "floor", "ceil", "abs", "sqrt", "exp", "log", "sin", "cos", "tan",
+        "asc", "desc", "xasc", "xdesc", "iasc", "idesc", "rank",
+        "string", "type", "upper", "lower", "trim", "ltrim", "rtrim",
+        "sv", "vs", "ss", "ssr", "raze", "enlist", "flip",
+    ];
+    BUILTINS.contains(&name.to_lowercase().as_str())
+}
+
+fn extract_candidate_func_names(expr: &str) -> Vec<String> {
+    let clean = strip_q_code(expr);
+    let tokens = tokenize_q_for_ro(&clean);
+    let mut names = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        if let QTok::Ident(name) = tok {
+            let is_call = match tokens.get(i + 1) {
+                Some(QTok::OpenBracket) | Some(QTok::OpenParen) => true,
+                _ => false,
+            };
+            if is_call && !is_builtin_or_keyword(name) && !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
+fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result<(), E> {
+    let names = extract_candidate_func_names(expr);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let syms = names.iter().map(|n| format!("`{}", n)).collect::<Vec<_>>().join("");
+    let probe = format!(
+        "{{[syms; max_d]\n\
+           denied:`delete`update`insert`upsert`set`hdel`hopen`hclose`system`exit`dpft`dpfts`rename`value`get`eval`save`load`rsave`rload`dsave;\n\
+           visited:()!();\n\
+           violator:\"\";\n\
+           scan_fn:{{[fn_sym; d]\n\
+             if[d > max_d; :()];\n\
+             if[fn_sym in key visited; :()];\n\
+             visited[fn_sym]:1;\n\
+             v:@[value; fn_sym; ::];\n\
+             if[100h ~ type v;\n\
+               src:lower string v;\n\
+               if[any {{any x in src}} each string denied; violator::string fn_sym; :()];\n\
+               if[any (\"0:\";\"1:\";\"2:\") in src; violator::string fn_sym; :()];\n\
+               sub:distinct raze @[{{value[x] 4}}; v; `symbol$()];\n\
+               sub:sub where {{100h ~ type @[value; x; ::]}} each sub;\n\
+               scan_fn[; d+1] each sub;\n\
+             ];\n\
+           }};\n\
+           scan_fn[; 1] each syms;\n\
+           violator\n\
+         }}[{}; {}]",
+        syms, max_depth
+    );
+    match conn.sync(&probe) {
+        Ok(K::CharV(violator)) if !violator.is_empty() => {
+            Err(E::usage(format!(
+                "readonly: blocked server function '{}' (mutating operation detected in call chain); unset --readonly / Q_CLI_READONLY to allow",
+                violator
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn render_output(k: &K, opts: &Opts) -> R {
+    if matches!(opts.out, OutMode::Text | OutMode::Json) && opts.max_rows > 0 {
+        if let Some(total) = render::table_rows(k) {
+            if total > opts.max_rows {
+                eprintln!(
+                    "note: showing {} of {} rows (--max-rows {})",
+                    opts.max_rows, total, opts.max_rows
+                );
+            }
+        }
+    }
+
+    Ok(match opts.out {
+        OutMode::Json => render::to_json(k, opts.max_rows),
+        OutMode::Csv => render::to_csv(k),
+        OutMode::Text | OutMode::Console => render::to_text(k, opts.max_rows),
+    })
+}
+
 fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
     let mut c = Conn::open(conn, opts.timeout)?;
+    if opts.readonly {
+        inspect_remote_funcs(&mut c, expr, 5)?;
+    }
     let expr_scoped = if opts.scoped {
         format!("{{[]\n{}\n}}[]", expr)
     } else {
@@ -402,24 +502,7 @@ fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
         expr_scoped
     };
     let k = c.sync(&to_send)?;
-
-    // truncation signal on stderr (text/json only; csv & console are uncapped)
-    if matches!(opts.out, OutMode::Text | OutMode::Json) && opts.max_rows > 0 {
-        if let Some(total) = render::table_rows(&k) {
-            if total > opts.max_rows {
-                eprintln!(
-                    "note: showing {} of {} rows (--max-rows {})",
-                    opts.max_rows, total, opts.max_rows
-                );
-            }
-        }
-    }
-
-    Ok(match opts.out {
-        OutMode::Json => render::to_json(&k, opts.max_rows),
-        OutMode::Csv => render::to_csv(&k),
-        OutMode::Text | OutMode::Console => render::to_text(&k, opts.max_rows),
-    })
+    render_output(&k, opts)
 }
 
 fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
@@ -444,6 +527,46 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
     }
 
     let mut c = Conn::open(conn, opts.timeout)?;
+
+    if opts.readonly {
+        inspect_remote_funcs(&mut c, &content, 5)?;
+    }
+
+    // Dry-run mode: Execute inside an isolated sandbox lambda {[] ... }[]
+    // Catches all syntax and runtime errors without mutating any global server state!
+    if opts.dry_run {
+        let sandbox = format!("{{[]\n{}\n}}[]", content);
+        let probe = format!("@[value; \"{}\"; {{'x}}]", q_escape(&sandbox));
+        match c.sync(&probe) {
+            Ok(_) => {
+                return Ok(format!(
+                    "dry-run: passed ({} statements validated, syntax and runtime sandbox OK)",
+                    stmts.len()
+                ));
+            }
+            Err(e) => {
+                return Err(E::query(format!("dry-run failed: {}", e.msg)));
+            }
+        }
+    }
+
+    // Atomic mode: Send the entire script as a single protected IPC evaluation
+    if opts.atomic {
+        let body = if opts.scoped {
+            format!("{{[]\n{}\n}}[]", content)
+        } else {
+            content
+        };
+        let to_send = if opts.out == OutMode::Console {
+            format!(".Q.s @[value; \"{}\"; {{'x}}]", q_escape(&body))
+        } else {
+            format!("@[value; \"{}\"; {{'x}}]", q_escape(&body))
+        };
+        let last_k = c.sync(&to_send)?;
+        return render_output(&last_k, opts);
+    }
+
+    // Sequential mode (default): Execute statement by statement with line-level failure reporting
     let mut last_k = K::Null;
     for (idx, s) in stmts.iter().enumerate() {
         let is_last = idx + 1 == stmts.len();
@@ -467,22 +590,7 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
         }
     }
 
-    if matches!(opts.out, OutMode::Text | OutMode::Json) && opts.max_rows > 0 {
-        if let Some(total) = render::table_rows(&last_k) {
-            if total > opts.max_rows {
-                eprintln!(
-                    "note: showing {} of {} rows (--max-rows {})",
-                    opts.max_rows, total, opts.max_rows
-                );
-            }
-        }
-    }
-
-    Ok(match opts.out {
-        OutMode::Json => render::to_json(&last_k, opts.max_rows),
-        OutMode::Csv => render::to_csv(&last_k),
-        OutMode::Text | OutMode::Console => render::to_text(&last_k, opts.max_rows),
-    })
+    render_output(&last_k, opts)
 }
 
 /// Resolve a conn token and run a fixed (q-cli-generated) expression on it.
@@ -780,10 +888,11 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
         ));
     }
 
-    // Validate assignments: ident::, ident,:, and ident: (outside select/exec projection)
+    // Validate assignments: ident::, ident,:, and ident: (outside select/exec projection and outside lambda local scopes)
     let tokens = tokenize_q_for_ro(&clean);
     let mut scope_stack: Vec<bool> = Vec::new();
     let mut in_projection = false;
+    let mut brace_depth: usize = 0;
     let mut prev_token: Option<&QTok> = None;
 
     for tok in &tokens {
@@ -794,10 +903,20 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
             QTok::From => {
                 in_projection = false;
             }
-            QTok::OpenParen | QTok::OpenBracket | QTok::OpenBrace => {
+            QTok::OpenBrace => {
+                brace_depth += 1;
                 scope_stack.push(in_projection);
             }
-            QTok::CloseParen | QTok::CloseBracket | QTok::CloseBrace => {
+            QTok::CloseBrace => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if let Some(prev) = scope_stack.pop() {
+                    in_projection = prev;
+                }
+            }
+            QTok::OpenParen | QTok::OpenBracket => {
+                scope_stack.push(in_projection);
+            }
+            QTok::CloseParen | QTok::CloseBracket => {
                 if let Some(prev) = scope_stack.pop() {
                     in_projection = prev;
                 }
@@ -825,7 +944,7 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
             }
             QTok::Colon => {
                 if let Some(QTok::Ident(name)) = prev_token {
-                    if !in_projection {
+                    if !in_projection && brace_depth == 0 {
                         return Err(E::usage(format!(
                             "readonly: blocked assignment ('{}:'); unset --readonly / Q_CLI_READONLY to allow",
                             name
@@ -893,6 +1012,8 @@ pub fn print_usage() {
          \x20 --timeout MS    query wait in ms (default 30000; or Q_CLI_TIMEOUT)\n\
          \x20 --readonly      reject mutating q (or set Q_CLI_READONLY=1)\n\
          \x20 --scoped        evaluate inside {[] ... }[] to isolate locals\n\
+         \x20 --atomic        run .q script as a single atomic protected block\n\
+         \x20 --dry-run       simulate script in sandbox without mutating state\n\
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
@@ -904,7 +1025,15 @@ mod tests {
     use super::*;
 
     fn ro_opts() -> Opts {
-        Opts { out: OutMode::Text, max_rows: 0, readonly: true, scoped: false, timeout: None }
+        Opts {
+            out: OutMode::Text,
+            max_rows: 0,
+            readonly: true,
+            scoped: false,
+            atomic: false,
+            dry_run: false,
+            timeout: None,
+        }
     }
 
     #[test]
@@ -1028,5 +1157,29 @@ ignored after eof
         assert!(ro("f[::; 1]", &ro_opts()).is_ok());
         // Comments containing denied keywords must not block
         assert!(ro("select from trade / delete from trade", &ro_opts()).is_ok());
+    }
+
+    #[test]
+    fn readonly_allows_lambda_local_variables_but_blocks_globals() {
+        // Local variables inside { ... } should be allowed
+        assert!(ro("{tmp: 1; select from t where x > tmp}[]", &ro_opts()).is_ok());
+        assert!(ro("{[x] y: x + 1; y*2}[10]", &ro_opts()).is_ok());
+        assert!(ro("{trade: 0#trade}[]", &ro_opts()).is_ok()); // local assignment in lambda
+
+        // But global assignment :: inside lambda must still be blocked
+        assert!(ro("{trade:: 0#trade}[]", &ro_opts()).is_err());
+        assert!(ro("{x::1}[]", &ro_opts()).is_err());
+    }
+
+    #[test]
+    fn candidate_function_names_extraction() {
+        let f1 = extract_candidate_func_names("cleanup[]");
+        assert_eq!(f1, vec!["cleanup"]);
+
+        let f2 = extract_candidate_func_names(".ns.my_func[1; 2]");
+        assert_eq!(f2, vec![".ns.my_func"]);
+
+        let f3 = extract_candidate_func_names("select count i by sym from trade");
+        assert!(f3.is_empty());
     }
 }
