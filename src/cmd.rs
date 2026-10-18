@@ -100,8 +100,19 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
     match &cmd.spec {
         Spec::Config => finish(config::run(&pos[1..]).map_err(E::usage), opts),
         Spec::Action(make) => {
-            // <action> <conn> — action first, connection second.
-            let action = pos.get(1).map(|s| s.as_str()).unwrap_or("");
+            // Support both `<action> <conn>` and `<conn> <action>`:
+            // e.g. `web off localhost:5000` OR `web localhost:5000 off`
+            let a1 = pos.get(1).map(|s| s.as_str()).unwrap_or("");
+            let a2 = pos.get(2).map(|s| s.as_str()).unwrap_or("");
+
+            let (action, conn_tok) = if a1.contains(':') || a1.starts_with('@') || (a1 == "@" && !a2.is_empty()) {
+                (a2, pos.get(1))
+            } else if !a2.is_empty() && (make(a2).is_ok() || a2 == "status") {
+                (a2, pos.get(1))
+            } else {
+                (a1, pos.get(2))
+            };
+
             // Validate the action first (so a bad verb gets its own message),
             // then enforce readonly: for web/trace, every action except `status`
             // rebinds a server message handler (.z.ph/.z.pp/.z.pg/.z.ps) — a
@@ -115,7 +126,7 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
                     ))),
                     opts,
                 ),
-                Ok(expr) => run_on(pos.get(2), &expr, opts),
+                Ok(expr) => run_on(conn_tok, &expr, opts),
             }
         }
         // <conn> — handshake probe.

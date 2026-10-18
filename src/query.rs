@@ -12,7 +12,7 @@ pub const INFO_Q: &str = "(`version`pid`port`handles`timer!(.z.K;.z.i;first syst
 /// (corrupt/locked partition) yields null counts instead of failing the whole
 /// command. Locals avoid q reserved names (`i`); the `columns` column avoids the
 /// `cols` keyword — either would raise `'assign`.
-pub const SCHEMA_Q: &str = "{ts:tables[]; if[0=count ts; :([] table:`$(); partitioned:`boolean$(); partition:`$(); rows:`long$(); columns:`long$())]; pf:@[{.Q.pf};::;`]; f:{[pf;t] @[{[pf;t] tt:value t; qp:.Q.qp tt; (qp~1b;$[qp~1b;pf;`];count tt;count cols tt)}[pf;]; t; (0b;`;0N;0N)]}; r:f[pf;] each ts; ([] table:ts; partitioned:r[;0]; partition:r[;1]; rows:r[;2]; columns:r[;3])}[]";
+pub const SCHEMA_Q: &str = "{ts:tables[]; if[0=count ts; :([] table:`$(); partitioned:`boolean$(); partition:`$(); rows:`long$(); columns:`long$())]; pf:@[{.Q.pf};::;`]; f:{[pf;t] @[{[pf;t] tt:value t; qp:.Q.qp tt; (qp~1b;$[qp~1b;pf;`];count tt;count cols tt)}[pf;]; t; (0b;`;0Nj;0Nj)]}; r:f[pf;] each ts; ([] table:ts; partitioned:r[;0]; partition:r[;1]; rows:r[;2]; columns:r[;3])}[]";
 
 /// One-shot table profile: name, partitioned?, partition field, rows, columns
 /// (meta), and a small sample. Sample is skipped for partitioned tables so we

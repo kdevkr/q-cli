@@ -28,9 +28,39 @@ pub fn scalar_to_string(k: &K) -> String {
     match k {
         K::Bool(b) => (if *b { "1" } else { "0" }).into(),
         K::Byte(x) => format!("0x{:02x}", x),
-        K::Short(v) => if *v == NULL_SHORT { "0N".into() } else { v.to_string() },
-        K::Int(v) => if *v == NULL_INT { "0N".into() } else { v.to_string() },
-        K::Long(v) => if *v == NULL_LONG { "0N".into() } else { v.to_string() },
+        K::Short(v) => {
+            if *v == NULL_SHORT {
+                "0N".into()
+            } else if *v == i16::MAX {
+                "0Wh".into()
+            } else if *v == -i16::MAX {
+                "-0Wh".into()
+            } else {
+                v.to_string()
+            }
+        }
+        K::Int(v) => {
+            if *v == NULL_INT {
+                "0N".into()
+            } else if *v == i32::MAX {
+                "0Wi".into()
+            } else if *v == -i32::MAX {
+                "-0Wi".into()
+            } else {
+                v.to_string()
+            }
+        }
+        K::Long(v) => {
+            if *v == NULL_LONG {
+                "0N".into()
+            } else if *v == i64::MAX {
+                "0Wj".into()
+            } else if *v == -i64::MAX {
+                "-0Wj".into()
+            } else {
+                v.to_string()
+            }
+        }
         K::Real(v) => fmt_float(*v as f64),
         K::Float(v) => fmt_float(*v),
         K::Char(c) => c.to_string(),
@@ -517,6 +547,11 @@ mod tests {
     #[test]
     fn scalar_nulls_and_floats() {
         assert_eq!(scalar_to_string(&K::Int(NULL_INT)), "0N");
+        assert_eq!(scalar_to_string(&K::Int(i32::MAX)), "0Wi");
+        assert_eq!(scalar_to_string(&K::Int(-i32::MAX)), "-0Wi");
+        assert_eq!(scalar_to_string(&K::Long(i64::MAX)), "0Wj");
+        assert_eq!(scalar_to_string(&K::Long(-i64::MAX)), "-0Wj");
+        assert_eq!(scalar_to_string(&K::Short(i16::MAX)), "0Wh");
         assert_eq!(scalar_to_string(&K::Float(f64::NAN)), "0n");
         assert_eq!(scalar_to_string(&K::Symbol("".into())), "`");
         assert_eq!(scalar_to_string(&K::Long(42)), "42");

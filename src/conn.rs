@@ -60,15 +60,25 @@ impl Conn {
                 });
             }
         };
-        // The read/write timeout bounds the query round-trip; `None` = wait
-        // forever. A timeout here surfaces as `timeout` (exit 5) from `sync`.
-        stream.set_read_timeout(timeout).ok();
-        stream
-            .set_write_timeout(timeout.map(|t| t.min(Duration::from_secs(10))))
-            .ok();
+        // Establishment (connect + handshake) timeout: cap at 5 seconds so a dead or
+        // stalled port fails fast (exit 3) instead of waiting for long query timeouts.
+        let handshake_timeout = match timeout {
+            Some(t) => t.min(Duration::from_secs(5)),
+            None => Duration::from_secs(5),
+        };
+        stream.set_read_timeout(Some(handshake_timeout)).ok();
+        stream.set_write_timeout(Some(handshake_timeout)).ok();
 
         let mut c = Conn { stream };
         c.handshake(&creds)?;
+
+        // Handshake succeeded: switch to the requested query round-trip timeout.
+        // `None` = wait forever; a timeout here surfaces as `timeout` (exit 5) from `sync`.
+        c.stream.set_read_timeout(timeout).ok();
+        c.stream
+            .set_write_timeout(timeout.map(|t| t.min(Duration::from_secs(10))))
+            .ok();
+
         Ok(c)
     }
 

@@ -75,8 +75,15 @@ fn parse(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((k, v)) = line.split_once('=') {
-            let (k, v) = (k.trim(), v.trim());
+        if let Some((k, mut v)) = line.split_once('=') {
+            let k = k.trim();
+            // Strip inline comments preceded by whitespace (e.g. ` # comment` or `\t# comment`)
+            if let Some((val_part, _)) = v.split_once(" #") {
+                v = val_part;
+            } else if let Some((val_part, _)) = v.split_once("\t#") {
+                v = val_part;
+            }
+            let v = v.trim();
             if !k.is_empty() && !v.is_empty() {
                 map.insert(k.to_string(), v.to_string());
             }
@@ -351,6 +358,17 @@ mod tests {
         assert_eq!(m.get("default").map(String::as_str), Some("local"));
         assert_eq!(m.get("local").map(String::as_str), Some("host:5000"));
         assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn parse_strips_inline_comments() {
+        let m = parse("dev = localhost:5000 # primary dev kdb\nprod = [::1]:5001:user:pass#word\t# prod");
+        assert_eq!(m.get("dev").map(String::as_str), Some("localhost:5000"));
+        // # without preceding whitespace in password is preserved
+        assert_eq!(
+            m.get("prod").map(String::as_str),
+            Some("[::1]:5001:user:pass#word")
+        );
     }
 
     #[test]

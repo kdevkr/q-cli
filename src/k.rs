@@ -561,6 +561,12 @@ pub fn fmt_date(d: i32) -> String {
     if d == NULL_INT {
         return String::new();
     }
+    if d == i32::MAX {
+        return "0Wd".into();
+    }
+    if d == -i32::MAX {
+        return "-0Wd".into();
+    }
     let (y, m, dd) = civil(d as i64);
     format!("{:04}.{:02}.{:02}", y, m, dd)
 }
@@ -568,6 +574,12 @@ pub fn fmt_date(d: i32) -> String {
 pub fn fmt_month(m: i32) -> String {
     if m == NULL_INT {
         return String::new();
+    }
+    if m == i32::MAX {
+        return "0Wm".into();
+    }
+    if m == -i32::MAX {
+        return "-0Wm".into();
     }
     let y = 2000 + m.div_euclid(12);
     let mon = m.rem_euclid(12) + 1;
@@ -590,6 +602,12 @@ pub fn fmt_timestamp(v: i64) -> String {
     if v == NULL_LONG {
         return String::new();
     }
+    if v == i64::MAX {
+        return "0Wp".into();
+    }
+    if v == -i64::MAX {
+        return "-0Wp".into();
+    }
     let (days, h, mi, s, ns) = hms_nanos(v);
     let (y, m, d) = civil(days);
     format!(
@@ -601,6 +619,12 @@ pub fn fmt_timestamp(v: i64) -> String {
 pub fn fmt_timespan(v: i64) -> String {
     if v == NULL_LONG {
         return String::new();
+    }
+    if v == i64::MAX {
+        return "0Wn".into();
+    }
+    if v == -i64::MAX {
+        return "-0Wn".into();
     }
     let neg = v < 0;
     let (days, h, mi, s, ns) = hms_nanos(v.abs());
@@ -619,6 +643,9 @@ pub fn fmt_datetime(v: f64) -> String {
     if v.is_nan() {
         return String::new();
     }
+    if v.is_infinite() {
+        return (if v.is_sign_positive() { "0Wz" } else { "-0Wz" }).into();
+    }
     let nanos = (v * 86_400_000_000_000.0).round() as i64;
     let (days, h, mi, s, ns) = hms_nanos(nanos);
     let (y, m, d) = civil(days);
@@ -632,6 +659,12 @@ pub fn fmt_datetime(v: f64) -> String {
 pub fn fmt_time(ms: i32) -> String {
     if ms == NULL_INT {
         return String::new();
+    }
+    if ms == i32::MAX {
+        return "0Wt".into();
+    }
+    if ms == -i32::MAX {
+        return "-0Wt".into();
     }
     let neg = ms < 0;
     let v = ms.abs();
@@ -649,6 +682,12 @@ pub fn fmt_minute(m: i32) -> String {
     if m == NULL_INT {
         return String::new();
     }
+    if m == i32::MAX {
+        return "0Wu".into();
+    }
+    if m == -i32::MAX {
+        return "-0Wu".into();
+    }
     let neg = m < 0;
     let v = m.abs();
     format!("{}{:02}:{:02}", if neg { "-" } else { "" }, v / 60, v % 60)
@@ -657,6 +696,12 @@ pub fn fmt_minute(m: i32) -> String {
 pub fn fmt_second(s: i32) -> String {
     if s == NULL_INT {
         return String::new();
+    }
+    if s == i32::MAX {
+        return "0Wv".into();
+    }
+    if s == -i32::MAX {
+        return "-0Wv".into();
     }
     let neg = s < 0;
     let v = s.abs();
@@ -875,5 +920,19 @@ mod tests {
         assert_eq!(at(&cv, 1), K::Char('나'));
         assert_eq!(at(&cv, 2), K::Char('다'));
         assert_eq!(at(&cv, 3), K::Null);
+    }
+
+    #[test]
+    fn temporal_infinity_formatting() {
+        assert_eq!(fmt_timestamp(i64::MAX), "0Wp");
+        assert_eq!(fmt_timestamp(-i64::MAX), "-0Wp");
+        assert_eq!(fmt_date(i32::MAX), "0Wd");
+        assert_eq!(fmt_date(-i32::MAX), "-0Wd");
+        assert_eq!(fmt_time(i32::MAX), "0Wt");
+        assert_eq!(fmt_timespan(i64::MAX), "0Wn");
+        assert_eq!(fmt_datetime(f64::INFINITY), "0Wz");
+        assert_eq!(fmt_datetime(f64::NEG_INFINITY), "-0Wz");
+        assert_eq!(fmt_minute(i32::MAX), "0Wu");
+        assert_eq!(fmt_second(i32::MAX), "0Wv");
     }
 }
