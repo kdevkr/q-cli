@@ -19,7 +19,7 @@ pub const SCHEMA_Q: &str = "{ts:tables[]; if[0=count ts; :([] table:`$(); partit
 /// never trigger a full multi-partition load. Locals stay inside the lambda.
 pub fn describe_q(t: &str) -> String {
     format!(
-        "{{[t] tt:value t; p:.Q.qp tt; `name`partitioned`partition`rows`columns`sample!(t;p;$[p~1b;.Q.pf;`];count tt;0!meta tt;$[p~1b;();3 sublist 0!tt])}}`{}",
+        "{{[t] tt:value t; p:1b~.Q.qp tt; `name`partitioned`partition`rows`columns`sample!(t;p;$[p;.Q.pf;`];count tt;0!meta tt;$[p;();3 sublist 0!tt])}}`{}",
         t
     )
 }
@@ -30,7 +30,7 @@ pub fn describe_q(t: &str) -> String {
 pub fn functions_q(ns: &str) -> String {
     let ns = ns.trim_start_matches('.');
     let nsym = if ns.is_empty() { "`".to_string() } else { format!("`{}", ns) };
-    const BODY: &str = "{[ns] fs:system $[ns~`;\"f\";\"f .\",string ns]; pre:$[ns~`;\"\";\".\",(string ns),\".\"]; full:`$pre,/:string each fs; ([] func:fs; args:{@[{count (value value x)1};x;0Ni]} each full)}";
+    const BODY: &str = "{[ns] fs:system $[ns~`;\"f\";\"f .\",string ns]; pre:$[ns~`;\"\";\".\",(string ns),\".\"]; full:`$pre,/:string each fs; ([] func:fs; args:`int${@[{count (value value x)1};x;0Ni]} each full)}";
     format!("{}[{}]", BODY, nsym)
 }
 

@@ -103,7 +103,7 @@ fn real_main() -> i32 {
                 }
             }
             "-h" | "--help" => {
-                cmd::print_usage();
+                cmd::print_help();
                 return 0;
             }
             "-V" | "--version" => {

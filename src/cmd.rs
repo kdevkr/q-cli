@@ -1039,8 +1039,7 @@ fn need_table(t: &str) -> Result<&str, E> {
     }
 }
 
-/// Usage text — the command list is generated from `CMDS`, so it never drifts.
-pub fn print_usage() {
+fn usage_string() -> String {
     let mut s = String::from("q-cli — native kdb+ IPC client\n\nUSAGE:\n");
     for c in CMDS {
         let out = matches!(c.spec, Spec::Eval { .. } | Spec::Run);
@@ -1054,7 +1053,7 @@ pub fn print_usage() {
     s.push_str(
         "\n\
          query/run/time accept '-' to read the q source from stdin.\n\
-         CONN: host:port[:user:pass] | @name | name | @ (default)\n\
+         CONN: [host]:port[:user:pass] | @name | name | @ (default)\n\
          \x20 config (merged, project overrides global):\n\
          \x20   global  $Q_CLI_CONFIG or ~/.config/q-cli/servers.conf\n\
          \x20   project nearest .q-cli.conf up from CWD  (config --project writes ./.q-cli.conf)\n\
@@ -1072,7 +1071,15 @@ pub fn print_usage() {
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
-    eprint!("{}", s);
+    s
+}
+
+pub fn print_help() {
+    print!("{}", usage_string());
+}
+
+pub fn print_usage() {
+    eprint!("{}", usage_string());
 }
 
 #[cfg(test)]
