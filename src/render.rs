@@ -132,6 +132,35 @@ fn compact_vec(k: &K, max: usize) -> String {
                 .replace('\t', "\\t");
             format!("\"{}\"", escaped)
         }
+        K::ByteV(v) => {
+            let n = v.len();
+            let shown = if max == 0 { n } else { n.min(max) };
+            let mut s = String::from("0x");
+            for b in &v[..shown] {
+                use std::fmt::Write;
+                write!(s, "{:02x}", b).ok();
+            }
+            if shown < n {
+                s.push_str("...");
+            }
+            s
+        }
+        K::BoolV(v) => {
+            let n = v.len();
+            if n == 0 {
+                return "0#0b".to_string();
+            }
+            let shown = if max == 0 { n } else { n.min(max) };
+            let mut s = String::with_capacity(shown + 2);
+            for b in &v[..shown] {
+                s.push(if *b { '1' } else { '0' });
+            }
+            s.push('b');
+            if shown < n {
+                s.push_str("...");
+            }
+            s
+        }
         K::SymbolV(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
@@ -656,4 +685,15 @@ mod tests {
         assert!(lines[2].contains("\"hello\\nworld\""));
         assert!(lines[3].contains("\"line1\\r\\nline2\\ttab\""));
     }
+
+    #[test]
+    fn compact_vec_byte_and_bool_vectors() {
+        assert_eq!(compact_vec(&K::ByteV(vec![1, 2, 255]), 0), "0x0102ff");
+        assert_eq!(compact_vec(&K::ByteV(vec![]), 0), "0x");
+        assert_eq!(compact_vec(&K::ByteV(vec![10, 20, 30]), 2), "0x0a14...");
+        assert_eq!(compact_vec(&K::BoolV(vec![true, false, true]), 0), "101b");
+        assert_eq!(compact_vec(&K::BoolV(vec![]), 0), "0#0b");
+        assert_eq!(compact_vec(&K::BoolV(vec![true, false, true, false]), 2), "10b...");
+    }
 }
+

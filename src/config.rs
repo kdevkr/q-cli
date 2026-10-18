@@ -28,10 +28,16 @@ const PROJECT_FILE: &str = ".q-cli.conf";
 // Paths
 // ---------------------------------------------------------------------------
 
-/// The global config path (`$Q_CLI_CONFIG` or `~/.config/q-cli/servers.conf`).
+/// The global config path (`$Q_CLI_CONFIG`, `$XDG_CONFIG_HOME/q-cli/servers.conf`, or `~/.config/q-cli/servers.conf`).
 pub fn global_path() -> PathBuf {
     if let Ok(p) = std::env::var("Q_CLI_CONFIG") {
         return PathBuf::from(p);
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let mut p = PathBuf::from(xdg);
+        p.push("q-cli");
+        p.push("servers.conf");
+        return p;
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -461,4 +467,16 @@ mod tests {
         assert!(add(dummy, "good-name_1", "bad alias with spaces").is_err());
         assert!(add(dummy, "good-name_1", "").is_err());
     }
+
+    #[test]
+    fn global_path_resolution() {
+        std::env::set_var("Q_CLI_CONFIG", "/custom/path/servers.conf");
+        assert_eq!(global_path(), PathBuf::from("/custom/path/servers.conf"));
+        std::env::remove_var("Q_CLI_CONFIG");
+
+        std::env::set_var("XDG_CONFIG_HOME", "/xdg/config");
+        assert_eq!(global_path(), PathBuf::from("/xdg/config/q-cli/servers.conf"));
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
 }
+

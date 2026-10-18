@@ -697,7 +697,16 @@ fn run_on(conn_tok: Option<&String>, expr: &str, opts: &Opts) -> i32 {
 pub fn finish(result: R, opts: &Opts) -> i32 {
     match result {
         Ok(s) => {
-            println!("{}", s);
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            if let Err(e) = writeln!(handle, "{}", s) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return 0;
+                }
+                eprintln!("ERR failed writing to stdout: {}", e);
+                return 1;
+            }
             0
         }
         Err(e) => {
