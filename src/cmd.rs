@@ -261,14 +261,16 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
 
         let first_char = line.chars().next();
         let is_indented = first_char.map(|c| c == ' ' || c == '\t').unwrap_or(false);
+        let was_in_str = in_str;
+        let line_to_push = if was_in_str { line } else { trimmed };
 
         if at_top_level && !is_indented {
             finish_stmt(&mut current_stmt, &mut stmts);
-            current_stmt = Some((line_no, vec![trimmed]));
+            current_stmt = Some((line_no, vec![line_to_push]));
         } else if let Some((_, ref mut lines)) = current_stmt {
-            lines.push(trimmed);
+            lines.push(line_to_push);
         } else if !trimmed.trim().is_empty() && !line.starts_with('/') {
-            current_stmt = Some((line_no, vec![trimmed]));
+            current_stmt = Some((line_no, vec![line_to_push]));
         }
 
         // Scan characters in line to update delimiter stack and string literal status
@@ -301,9 +303,13 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
                 continue;
             }
 
-            // Inline comment: whitespace followed by '/'
+            // Inline comment: whitespace followed by '/' (excluding adverb '/:')
             if prev_ws && c == '/' {
-                break; // rest of the line is a comment
+                if i + 1 < chars.len() && chars[i + 1] == ':' {
+                    // Adverb /: (each-right), not a comment
+                } else {
+                    break; // rest of the line is a comment
+                }
             }
 
             match c {
@@ -334,6 +340,15 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
 
             prev_ws = c.is_whitespace();
             i += 1;
+        }
+
+        // If string literal is still open at end of line, preserve trailing whitespace on opening line
+        if in_str && !was_in_str {
+            if let Some((_, ref mut lines)) = current_stmt {
+                if let Some(last) = lines.last_mut() {
+                    *last = line;
+                }
+            }
         }
     }
     finish_stmt(&mut current_stmt, &mut stmts);
@@ -458,21 +473,26 @@ fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result
            denied:`delete`update`insert`upsert`set`hdel`hopen`hclose`system`exit`dpft`dpfts`rename`value`get`eval`save`load`rsave`rload`dsave;\n\
            visited:()!();\n\
            violator:\"\";\n\
-           scan_fn:{{[fn_sym; d]\n\
-             if[d > max_d; :()];\n\
-             if[fn_sym in key visited; :()];\n\
-             visited[fn_sym]:1;\n\
-             v:@[value; fn_sym; ::];\n\
-             if[100h ~ type v;\n\
-               src:lower string v;\n\
-               if[any {{any x in src}} each string denied; violator::string fn_sym; :()];\n\
-               if[any (\"0:\";\"1:\";\"2:\") in src; violator::string fn_sym; :()];\n\
-               sub:distinct raze @[{{value[x] 4}}; v; `symbol$()];\n\
-               sub:sub where {{100h ~ type @[value; x; ::]}} each sub;\n\
-               scan_fn[; d+1] each sub;\n\
+           queue:distinct syms;\n\
+           steps:0;\n\
+           max_steps:max_d * 20;\n\
+           while[(steps < max_steps) and (count queue) and 0 = count violator;\n\
+             curr:first queue;\n\
+             queue:1 _ queue;\n\
+             if[not curr in key visited;\n\
+               visited[curr]:1;\n\
+               v:@[value; curr; ::];\n\
+               if[100h ~ type v;\n\
+                 src:lower string v;\n\
+                 if[any {{x like \"*\",string[y],\"*\"}}[src;] each denied; violator:string curr];\n\
+                 if[any {{x like \"*\",y,\"*\"}}[src;] each (\"0:\";\"1:\";\"2:\"); violator:string curr];\n\
+                 sub:distinct raze @[{{value[x] 3}}; v; `symbol$()];\n\
+                 sub:sub where {{100h ~ type @[value; x; ::]}} each sub;\n\
+                 queue:distinct queue,sub where not sub in key visited;\n\
+               ];\n\
              ];\n\
-           }};\n\
-           scan_fn[; 1] each syms;\n\
+             steps+:1;\n\
+           ];\n\
            violator\n\
          }}[{}; {}]",
         syms, max_depth
@@ -748,7 +768,11 @@ pub fn strip_q_code(expr: &str) -> String {
             }
 
             if prev_ws && c == '/' {
-                break;
+                if i + 1 < chars.len() && chars[i + 1] == ':' {
+                    // Adverb /: (each-right), not a comment
+                } else {
+                    break;
+                }
             }
 
             out.push(c);
@@ -972,7 +996,7 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
             }
             QTok::Colon => {
                 if let Some(QTok::Ident(name)) = prev_token {
-                    if !in_projection && brace_depth == 0 {
+                    if !in_projection && (brace_depth == 0 || name.contains('.')) {
                         return Err(E::usage(format!(
                             "readonly: blocked assignment ('{}:'); unset --readonly / Q_CLI_READONLY to allow",
                             name
@@ -1196,9 +1220,31 @@ ignored after eof
         assert!(ro("{[x] y: x + 1; y*2}[10]", &ro_opts()).is_ok());
         assert!(ro("{trade: 0#trade}[]", &ro_opts()).is_ok()); // local assignment in lambda
 
-        // But global assignment :: inside lambda must still be blocked
+        // But global assignment :: or namespaced assignment with . inside lambda must still be blocked
         assert!(ro("{trade:: 0#trade}[]", &ro_opts()).is_err());
         assert!(ro("{x::1}[]", &ro_opts()).is_err());
+        assert!(ro("{.t: 1}[]", &ro_opts()).is_err());
+        assert!(ro("{.ns.x: 1}[]", &ro_opts()).is_err());
+    }
+
+    #[test]
+    fn adverb_each_right_not_treated_as_comment() {
+        let code = "res: x /: y;\nt: 1";
+        let stmts = split_q_script(code).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].text, "res: x /: y;");
+
+        let stripped = strip_q_code("1 2 , /: 3 4 / actual comment");
+        assert!(stripped.contains("/:"));
+        assert!(!stripped.contains("actual comment"));
+    }
+
+    #[test]
+    fn split_q_script_preserves_multiline_string_trailing_whitespace() {
+        let script = "s:\"line 1   \nline 2   \nline 3\";\nx:1";
+        let stmts = split_q_script(script).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].text.contains("line 1   \nline 2   \nline 3"));
     }
 
     #[test]

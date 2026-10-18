@@ -133,7 +133,7 @@ pub fn resolve_conn(token: &str) -> Result<String, String> {
 }
 
 pub fn resolve_alias(key: &str, servers: &HashMap<String, String>) -> Result<String, String> {
-    let mut current = key.to_string();
+    let mut current = key.strip_prefix('@').unwrap_or(key).to_string();
     let mut visited = std::collections::HashSet::new();
     visited.insert(current.clone());
 
@@ -145,14 +145,15 @@ pub fn resolve_alias(key: &str, servers: &HashMap<String, String>) -> Result<Str
     let mut hops = 0;
     while !val.contains(':') {
         hops += 1;
-        if hops > 16 || visited.contains(&val) {
+        let next_key = val.strip_prefix('@').unwrap_or(&val).to_string();
+        if hops > 16 || visited.contains(&next_key) {
             return Err(format!(
                 "alias cycle or too many redirects starting at '{}'",
                 key
             ));
         }
-        visited.insert(val.clone());
-        current = val.clone();
+        visited.insert(next_key.clone());
+        current = next_key;
         val = servers
             .get(&current)
             .cloned()
@@ -409,5 +410,19 @@ mod tests {
         servers.insert("c".into(), "a".into());
 
         assert!(resolve_alias("a", &servers).is_err());
+    }
+
+    #[test]
+    fn alias_with_at_prefix_resolution() {
+        let mut servers = HashMap::new();
+        servers.insert("default".into(), "@local".into());
+        servers.insert("local".into(), "@remote".into());
+        servers.insert("remote".into(), "cluster:5000".into());
+
+        assert_eq!(
+            resolve_alias("default", &servers).unwrap(),
+            "cluster:5000"
+        );
+        assert_eq!(resolve_alias("@default", &servers).unwrap(), "cluster:5000");
     }
 }
