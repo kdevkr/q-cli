@@ -182,15 +182,22 @@ pub struct QStatement {
 }
 
 /// Split a q script into top-level statements according to q syntax rules:
-/// - A line with non-whitespace at column 0 starts a new statement.
+/// - A line with non-whitespace at column 0 starts a new statement, UNLESS:
+///   - It is inside open brackets/braces/parentheses (`{`, `(`, `[`).
+///   - It is inside a multi-line string literal (`"..."`).
 /// - Indented lines (starting with space or tab) continue the current statement.
-/// - Single-line comments start with `/` at column 0.
+/// - Single-line comments start with `/` at column 0 or preceded by whitespace.
 /// - Block comments start with `/` alone on a line and end with `\` alone on a line.
 /// - A lone `\` at column 0 stops processing (EOF marker in q scripts).
-pub fn split_q_script(src: &str) -> Vec<QStatement> {
+/// - Delimiter mismatches or unclosed strings return a syntax error before any
+///   statement is executed, preventing partial script application.
+pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
     let mut stmts = Vec::new();
     let mut current_stmt: Option<(usize, Vec<&str>)> = None;
     let mut in_block_comment = false;
+    let mut in_str = false;
+    let mut str_start_line = None;
+    let mut delimiter_stack: Vec<(char, usize)> = Vec::new();
 
     let finish_stmt = |cur: &mut Option<(usize, Vec<&str>)>, stmts: &mut Vec<QStatement>| {
         if let Some((line_no, lines)) = cur.take() {
@@ -212,44 +219,126 @@ pub fn split_q_script(src: &str) -> Vec<QStatement> {
             continue;
         }
 
-        // A slash alone on a line starts a multi-line comment block
-        if trimmed == "/" {
-            in_block_comment = true;
-            finish_stmt(&mut current_stmt, &mut stmts);
-            continue;
-        }
+        let at_top_level = !in_str && delimiter_stack.is_empty();
 
-        // A backslash alone on a line ends script execution (q EOF)
-        if trimmed == "\\" {
-            finish_stmt(&mut current_stmt, &mut stmts);
-            break;
-        }
-
-        if line.starts_with('/') {
-            finish_stmt(&mut current_stmt, &mut stmts);
-            continue;
-        }
-
-        if trimmed.trim().is_empty() {
-            finish_stmt(&mut current_stmt, &mut stmts);
-            continue;
-        }
-
-        let first_char = line.chars().next().unwrap();
-        if first_char == ' ' || first_char == '\t' {
-            if let Some((_, ref mut lines)) = current_stmt {
-                lines.push(trimmed);
-            } else {
-                current_stmt = Some((line_no, vec![trimmed]));
+        if at_top_level {
+            // A slash alone on a line starts a multi-line comment block
+            if trimmed == "/" {
+                in_block_comment = true;
+                finish_stmt(&mut current_stmt, &mut stmts);
+                continue;
             }
-        } else {
+
+            // A backslash alone on a line ends script execution (q EOF)
+            if trimmed == "\\" {
+                finish_stmt(&mut current_stmt, &mut stmts);
+                break;
+            }
+
+            if line.starts_with('/') {
+                finish_stmt(&mut current_stmt, &mut stmts);
+                continue;
+            }
+
+            if trimmed.trim().is_empty() {
+                finish_stmt(&mut current_stmt, &mut stmts);
+                continue;
+            }
+        }
+
+        let first_char = line.chars().next();
+        let is_indented = first_char.map(|c| c == ' ' || c == '\t').unwrap_or(false);
+
+        if at_top_level && !is_indented {
             finish_stmt(&mut current_stmt, &mut stmts);
             current_stmt = Some((line_no, vec![trimmed]));
+        } else if let Some((_, ref mut lines)) = current_stmt {
+            lines.push(trimmed);
+        } else if !trimmed.trim().is_empty() && !line.starts_with('/') {
+            current_stmt = Some((line_no, vec![trimmed]));
+        }
+
+        // Scan characters in line to update delimiter stack and string literal status
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut prev_ws = true;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '\\' {
+                    i += 2; // skip escaped character (e.g. \" or \\)
+                    continue;
+                } else if c == '"' {
+                    in_str = false;
+                    str_start_line = None;
+                    prev_ws = false;
+                    i += 1;
+                    continue;
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            if c == '"' {
+                in_str = true;
+                str_start_line = Some(line_no);
+                prev_ws = false;
+                i += 1;
+                continue;
+            }
+
+            // Inline comment: whitespace followed by '/'
+            if prev_ws && c == '/' {
+                break; // rest of the line is a comment
+            }
+
+            match c {
+                '{' | '(' | '[' => delimiter_stack.push((c, line_no)),
+                '}' => {
+                    if let Some(&(top, _)) = delimiter_stack.last() {
+                        if top == '{' {
+                            delimiter_stack.pop();
+                        }
+                    }
+                }
+                ')' => {
+                    if let Some(&(top, _)) = delimiter_stack.last() {
+                        if top == '(' {
+                            delimiter_stack.pop();
+                        }
+                    }
+                }
+                ']' => {
+                    if let Some(&(top, _)) = delimiter_stack.last() {
+                        if top == '[' {
+                            delimiter_stack.pop();
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            prev_ws = c.is_whitespace();
+            i += 1;
         }
     }
     finish_stmt(&mut current_stmt, &mut stmts);
 
-    stmts
+    if let Some(start_line) = str_start_line {
+        return Err(E::usage(format!(
+            "syntax error: unclosed string literal starting at line {}",
+            start_line
+        )));
+    }
+    if let Some(&(ch, start_line)) = delimiter_stack.last() {
+        return Err(E::usage(format!(
+            "syntax error: unclosed '{}' starting at line {}",
+            ch, start_line
+        )));
+    }
+
+    Ok(stmts)
 }
 
 fn build_time(expr: &str) -> R {
@@ -343,7 +432,7 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
             .map_err(|e| E::usage(format!("cannot read file '{}': {}", path, e)))?
     };
 
-    let stmts = split_q_script(&content);
+    let stmts = split_q_script(&content)?;
     if stmts.is_empty() {
         return Ok(String::new());
     }
@@ -356,11 +445,17 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
 
     let mut c = Conn::open(conn, opts.timeout)?;
     let mut last_k = K::Null;
-    for s in &stmts {
+    for (idx, s) in stmts.iter().enumerate() {
+        let is_last = idx + 1 == stmts.len();
         let to_send = if opts.scoped {
             format!("{{[]\n{}\n}}[]", s.text)
         } else {
             s.text.clone()
+        };
+        let to_send = if is_last && opts.out == OutMode::Console {
+            format!(".Q.s value \"{}\"", q_escape(&to_send))
+        } else {
+            to_send
         };
         match c.sync(&to_send) {
             Ok(k) => {
@@ -368,6 +463,17 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
             }
             Err(e) => {
                 return Err(E::query(format!("line {}: {}", s.line_no, e.msg)));
+            }
+        }
+    }
+
+    if matches!(opts.out, OutMode::Text | OutMode::Json) && opts.max_rows > 0 {
+        if let Some(total) = render::table_rows(&last_k) {
+            if total > opts.max_rows {
+                eprintln!(
+                    "note: showing {} of {} rows (--max-rows {})",
+                    opts.max_rows, total, opts.max_rows
+                );
             }
         }
     }
@@ -418,6 +524,7 @@ pub fn finish(result: R, opts: &Opts) -> i32 {
 /// not trip the `delete` denylist. Backslash escapes inside a string are
 /// honoured. (A symbol literal like `` `delete `` is still scanned — rare, and
 /// erring toward over-blocking is the safe default for a readonly guard.)
+#[cfg(test)]
 fn strip_q_strings(expr: &str) -> String {
     let mut out = String::with_capacity(expr.len());
     let mut chars = expr.chars();
@@ -444,24 +551,202 @@ fn strip_q_strings(expr: &str) -> String {
     out
 }
 
+/// Strip both string contents and comments (line comments, inline comments, block comments)
+/// from a q expression so the readonly scan inspects code syntax without false positives.
+pub fn strip_q_code(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut in_str = false;
+    let mut in_block_comment = false;
+
+    for line in expr.lines() {
+        let trimmed = line.trim();
+        if in_block_comment {
+            if trimmed == "\\" {
+                in_block_comment = false;
+            }
+            out.push('\n');
+            continue;
+        }
+        if !in_str {
+            if trimmed == "/" {
+                in_block_comment = true;
+                out.push('\n');
+                continue;
+            }
+            if trimmed == "\\" {
+                break;
+            }
+            if line.starts_with('/') {
+                out.push('\n');
+                continue;
+            }
+        }
+
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut prev_ws = true;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                } else if c == '"' {
+                    in_str = false;
+                    out.push('"');
+                    prev_ws = false;
+                    i += 1;
+                    continue;
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            if c == '"' {
+                in_str = true;
+                out.push('"');
+                prev_ws = false;
+                i += 1;
+                continue;
+            }
+
+            if prev_ws && c == '/' {
+                break;
+            }
+
+            out.push(c);
+            prev_ws = c.is_whitespace();
+            i += 1;
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum QTok {
+    Ident(String),
+    Colon,
+    DoubleColon,
+    CompoundColon(char),
+    Select,
+    Exec,
+    From,
+    OpenParen,
+    CloseParen,
+    OpenBracket,
+    CloseBracket,
+    OpenBrace,
+    CloseBrace,
+    Semi,
+    Other,
+}
+
+fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        if c == ':' {
+            if i + 1 < chars.len() && chars[i + 1] == ':' {
+                tokens.push(QTok::DoubleColon);
+                i += 2;
+            } else {
+                tokens.push(QTok::Colon);
+                i += 1;
+            }
+            continue;
+        }
+
+        if matches!(c, ',' | '+' | '-' | '*' | '%' | '&' | '|' | '^' | '_') {
+            if i + 1 < chars.len() && chars[i + 1] == ':' {
+                tokens.push(QTok::CompoundColon(c));
+                i += 2;
+                continue;
+            }
+        }
+
+        match c {
+            '(' => { tokens.push(QTok::OpenParen); i += 1; continue; }
+            ')' => { tokens.push(QTok::CloseParen); i += 1; continue; }
+            '[' => { tokens.push(QTok::OpenBracket); i += 1; continue; }
+            ']' => { tokens.push(QTok::CloseBracket); i += 1; continue; }
+            '{' => { tokens.push(QTok::OpenBrace); i += 1; continue; }
+            '}' => { tokens.push(QTok::CloseBrace); i += 1; continue; }
+            ';' => { tokens.push(QTok::Semi); i += 1; continue; }
+            _ => {}
+        }
+
+        if c.is_ascii_alphabetic() || c == '.' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let lower = word.to_lowercase();
+            match lower.as_str() {
+                "select" => tokens.push(QTok::Select),
+                "exec" => tokens.push(QTok::Exec),
+                "from" => tokens.push(QTok::From),
+                _ => tokens.push(QTok::Ident(word)),
+            }
+            continue;
+        }
+
+        tokens.push(QTok::Other);
+        i += 1;
+    }
+    tokens
+}
+
 /// Readonly guard: in readonly mode, reject arbitrary q that looks mutating.
-/// This is a heuristic denylist (q is not SQL), not a sandbox.
+/// This blocks:
+/// - File & dynamic library I/O (0:, 1:, 2:)
+/// - System backslash commands (\)
+/// - Mutating keywords (delete, update, insert, upsert, set, value, get, eval, save, load, etc.)
+/// - Amends (@[, .[)
+/// - System/handler namespace mutations (.z., .ps.)
+/// - Global assignments (ident::) and compound assignments (ident,:, ident+:, etc.)
+/// - Variable assignments (ident:) outside of select/exec column projections
 fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
     if !opts.readonly {
         return Ok(());
     }
-    let lower = strip_q_strings(expr).to_lowercase();
-    for op in ["0:", "1:"] {
+
+    let clean = strip_q_code(expr);
+
+    // Reject system backslash commands (e.g. \rm, \cd, \p, etc.)
+    for stmt in clean.split(';') {
+        let t = stmt.trim();
+        if t.starts_with('\\') {
+            return Err(E::usage(
+                "readonly: blocked system command ('\\'); unset --readonly / Q_CLI_READONLY to allow"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let lower = clean.to_lowercase();
+    for op in ["0:", "1:", "2:"] {
         if lower.contains(op) {
             return Err(E::usage(format!(
-                "readonly: blocked '{}' (file I/O); unset --readonly / Q_CLI_READONLY to allow",
+                "readonly: blocked '{}' (file/dynamic I/O); unset --readonly / Q_CLI_READONLY to allow",
                 op
             )));
         }
     }
+
     const DENIED: &[&str] = &[
         "delete", "update", "insert", "upsert", "set", "hdel", "hopen", "hclose", "system",
-        "exit", "dpft", "dpfts", "rename", "value",
+        "exit", "dpft", "dpfts", "rename", "value", "get", "eval", "save", "load", "rsave",
+        "rload", "dsave",
     ];
     for tok in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         if DENIED.contains(&tok) {
@@ -471,16 +756,88 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
             )));
         }
     }
-    if lower.contains("@[") || lower.contains(".[") {
-        return Err(E::usage(
-            "readonly: blocked amend ('@[' / '.['); unset --readonly / Q_CLI_READONLY to allow".to_string(),
-        ));
+
+    // Amend @[...] or .[...] with optional whitespace before bracket
+    let chars: Vec<char> = clean.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i] == '@' || chars[i] == '.' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '[' {
+                return Err(E::usage(
+                    "readonly: blocked amend ('@[' / '.['); unset --readonly / Q_CLI_READONLY to allow"
+                        .to_string(),
+                ));
+            }
+        }
     }
+
     if lower.contains(".z.") || lower.contains(".ps.") {
         return Err(E::usage(
             "readonly: blocked system/handler namespace mutation ('.z.' / '.ps.'); unset --readonly / Q_CLI_READONLY to allow".to_string(),
         ));
     }
+
+    // Validate assignments: ident::, ident,:, and ident: (outside select/exec projection)
+    let tokens = tokenize_q_for_ro(&clean);
+    let mut scope_stack: Vec<bool> = Vec::new();
+    let mut in_projection = false;
+    let mut prev_token: Option<&QTok> = None;
+
+    for tok in &tokens {
+        match tok {
+            QTok::Select | QTok::Exec => {
+                in_projection = true;
+            }
+            QTok::From => {
+                in_projection = false;
+            }
+            QTok::OpenParen | QTok::OpenBracket | QTok::OpenBrace => {
+                scope_stack.push(in_projection);
+            }
+            QTok::CloseParen | QTok::CloseBracket | QTok::CloseBrace => {
+                if let Some(prev) = scope_stack.pop() {
+                    in_projection = prev;
+                }
+            }
+            QTok::Semi => {
+                if scope_stack.is_empty() {
+                    in_projection = false;
+                }
+            }
+            QTok::DoubleColon => {
+                if let Some(QTok::Ident(name)) = prev_token {
+                    return Err(E::usage(format!(
+                        "readonly: blocked global assignment ('{}::'); unset --readonly / Q_CLI_READONLY to allow",
+                        name
+                    )));
+                }
+            }
+            QTok::CompoundColon(op) => {
+                if let Some(QTok::Ident(name)) = prev_token {
+                    return Err(E::usage(format!(
+                        "readonly: blocked compound assignment ('{}{}:'); unset --readonly / Q_CLI_READONLY to allow",
+                        name, op
+                    )));
+                }
+            }
+            QTok::Colon => {
+                if let Some(QTok::Ident(name)) = prev_token {
+                    if !in_projection {
+                        return Err(E::usage(format!(
+                            "readonly: blocked assignment ('{}:'); unset --readonly / Q_CLI_READONLY to allow",
+                            name
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev_token = Some(tok);
+    }
+
     Ok(())
 }
 
@@ -613,7 +970,7 @@ h:{1}
 \
 ignored after eof
 "#;
-        let stmts = split_q_script(script);
+        let stmts = split_q_script(script).unwrap();
         assert_eq!(stmts.len(), 3);
         assert_eq!(stmts[0].line_no, 5);
         assert!(stmts[0].text.starts_with("f:{[x]"));
@@ -622,5 +979,54 @@ ignored after eof
         assert_eq!(stmts[1].text, "g:{x*2}");
         assert_eq!(stmts[2].line_no, 11);
         assert_eq!(stmts[2].text, "h:{1}");
+    }
+
+    #[test]
+    fn split_q_script_handles_closing_brace_at_column_zero() {
+        let script = "f:{[x]\n  a:x+1;\n  a*2\n}\ng:{x}";
+        let stmts = split_q_script(script).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].line_no, 1);
+        assert_eq!(stmts[0].text, "f:{[x]\n  a:x+1;\n  a*2\n}");
+        assert_eq!(stmts[1].line_no, 5);
+        assert_eq!(stmts[1].text, "g:{x}");
+    }
+
+    #[test]
+    fn split_q_script_handles_multiline_string_and_detects_unclosed() {
+        let script = "s:\"line 1\nline 2\";\nt:1";
+        let stmts = split_q_script(script).unwrap();
+        assert_eq!(stmts.len(), 2);
+
+        let unclosed_brace = "f:{[x]\n  x+1";
+        assert!(split_q_script(unclosed_brace).is_err());
+
+        let unclosed_str = "s:\"hello";
+        assert!(split_q_script(unclosed_str).is_err());
+    }
+
+    #[test]
+    fn readonly_blocks_assignments_and_system_commands() {
+        assert!(ro("t: 0#t", &ro_opts()).is_err());
+        assert!(ro("trade: 1", &ro_opts()).is_err());
+        assert!(ro("trade::1", &ro_opts()).is_err());
+        assert!(ro("t,: (1; 2)", &ro_opts()).is_err());
+        assert!(ro("t +: 1", &ro_opts()).is_err());
+        assert!(ro("trade: select from trade", &ro_opts()).is_err());
+        assert!(ro("\"lib.so\" 2: (\"f\"; 1)", &ro_opts()).is_err());
+        assert!(ro("\\rm -rf /", &ro_opts()).is_err());
+        assert!(ro("1+1; \\cd /", &ro_opts()).is_err());
+        assert!(ro("get \"delete from t\"", &ro_opts()).is_err());
+        assert!(ro("eval (insert; `t; 1)", &ro_opts()).is_err());
+    }
+
+    #[test]
+    fn readonly_allows_select_aliases_comments_and_generic_null() {
+        assert!(ro("select c: count i, max_p: max price from trade", &ro_opts()).is_ok());
+        assert!(ro("exec p: last price from trade", &ro_opts()).is_ok());
+        assert!(ro("(::)", &ro_opts()).is_ok());
+        assert!(ro("f[::; 1]", &ro_opts()).is_ok());
+        // Comments containing denied keywords must not block
+        assert!(ro("select from trade / delete from trade", &ro_opts()).is_ok());
     }
 }

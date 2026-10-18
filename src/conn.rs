@@ -29,7 +29,7 @@ impl Conn {
             .parse()
             .map_err(|_| E::usage(format!("bad port '{}'", parts[1])))?;
         let creds = if parts.len() >= 4 {
-            format!("{}:{}", parts[2], parts[3])
+            format!("{}:{}", parts[2], parts[3..].join(":"))
         } else if parts.len() == 3 {
             parts[2].to_string()
         } else {
@@ -139,6 +139,13 @@ impl Conn {
         } as usize;
         if len < 8 {
             return Err(E::connect(format!("invalid response length {}", len)));
+        }
+        const MAX_MSG_LEN: usize = 1024 * 1024 * 1024; // 1 GB cap prevents OOM on non-kdb ports
+        if len > MAX_MSG_LEN {
+            return Err(E::connect(format!(
+                "response length {} exceeds 1GB limit (rogue port or invalid message)",
+                len
+            )));
         }
         let mut payload = vec![0u8; len - 8];
         self.stream

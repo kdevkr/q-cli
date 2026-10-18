@@ -4,7 +4,7 @@
 /// The common result of a command: a rendered string, or a structured error.
 pub type R = Result<String, E>;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Usage,
     Connect,
@@ -31,6 +31,7 @@ impl Kind {
     }
 }
 
+#[derive(Debug)]
 pub struct E {
     pub kind: Kind,
     pub msg: String,

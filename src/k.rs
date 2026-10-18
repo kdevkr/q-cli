@@ -126,19 +126,30 @@ impl<'a> Reader<'a> {
         while self.pos < self.buf.len() && self.buf[self.pos] != 0 {
             self.pos += 1;
         }
+        if self.pos >= self.buf.len() {
+            return Err("unterminated symbol in response".to_string());
+        }
         let s = String::from_utf8_lossy(&self.buf[start..self.pos]).into_owned();
         self.pos += 1; // skip null
         Ok(s)
     }
 
-    /// vector header: attribute byte + i32 length
-    fn vhdr(&mut self) -> Result<usize, String> {
+    /// vector header: attribute byte + i32 length, bounded by remaining buffer.
+    fn vhdr(&mut self, elem_size: usize) -> Result<usize, String> {
         let _attr = self.u8()?;
         let n = self.i32()?;
         if n < 0 {
             return Err("negative vector length".to_string());
         }
-        Ok(n as usize)
+        let count = n as usize;
+        let remaining = self.buf.len().saturating_sub(self.pos);
+        if count.saturating_mul(elem_size) > remaining {
+            return Err(format!(
+                "vector length {} exceeds remaining payload ({} bytes)",
+                count, remaining
+            ));
+        }
+        Ok(count)
     }
 
     /// Read one K object at the cursor.
@@ -166,7 +177,7 @@ impl<'a> Reader<'a> {
             -19 => Ok(K::Time(self.i32()?)),
             // ---- vectors ----
             0 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(1)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.read()?);
@@ -174,7 +185,7 @@ impl<'a> Reader<'a> {
                 Ok(K::List(v))
             }
             1 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(1)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.u8()? != 0);
@@ -182,7 +193,7 @@ impl<'a> Reader<'a> {
                 Ok(K::BoolV(v))
             }
             2 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(16)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.guid()?);
@@ -190,11 +201,11 @@ impl<'a> Reader<'a> {
                 Ok(K::GuidV(v))
             }
             4 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(1)?;
                 Ok(K::ByteV(self.take(n)?.to_vec()))
             }
             5 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(2)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i16()?);
@@ -202,7 +213,7 @@ impl<'a> Reader<'a> {
                 Ok(K::ShortV(v))
             }
             6 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -210,7 +221,7 @@ impl<'a> Reader<'a> {
                 Ok(K::IntV(v))
             }
             7 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(8)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i64()?);
@@ -218,7 +229,7 @@ impl<'a> Reader<'a> {
                 Ok(K::LongV(v))
             }
             8 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.f32()?);
@@ -226,7 +237,7 @@ impl<'a> Reader<'a> {
                 Ok(K::RealV(v))
             }
             9 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(8)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.f64()?);
@@ -234,12 +245,12 @@ impl<'a> Reader<'a> {
                 Ok(K::FloatV(v))
             }
             10 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(1)?;
                 let bytes = self.take(n)?;
                 Ok(K::CharV(String::from_utf8_lossy(bytes).into_owned()))
             }
             11 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(1)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.sym()?);
@@ -247,7 +258,7 @@ impl<'a> Reader<'a> {
                 Ok(K::SymbolV(v))
             }
             12 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(8)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i64()?);
@@ -255,7 +266,7 @@ impl<'a> Reader<'a> {
                 Ok(K::TimestampV(v))
             }
             13 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -263,7 +274,7 @@ impl<'a> Reader<'a> {
                 Ok(K::MonthV(v))
             }
             14 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -271,7 +282,7 @@ impl<'a> Reader<'a> {
                 Ok(K::DateV(v))
             }
             15 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(8)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.f64()?);
@@ -279,7 +290,7 @@ impl<'a> Reader<'a> {
                 Ok(K::DatetimeV(v))
             }
             16 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(8)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i64()?);
@@ -287,7 +298,7 @@ impl<'a> Reader<'a> {
                 Ok(K::TimespanV(v))
             }
             17 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -295,7 +306,7 @@ impl<'a> Reader<'a> {
                 Ok(K::MinuteV(v))
             }
             18 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -303,7 +314,7 @@ impl<'a> Reader<'a> {
                 Ok(K::SecondV(v))
             }
             19 => {
-                let n = self.vhdr()?;
+                let n = self.vhdr(4)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.i32()?);
@@ -344,7 +355,10 @@ impl<'a> Reader<'a> {
             }
             104 => {
                 let n = self.i32()?;
-                let mut v = Vec::with_capacity(n.max(0) as usize);
+                if n < 0 || (n as usize) > self.buf.len().saturating_sub(self.pos) {
+                    return Err("invalid projection length".to_string());
+                }
+                let mut v = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     v.push(self.read()?);
                 }
@@ -352,7 +366,10 @@ impl<'a> Reader<'a> {
             }
             105 => {
                 let n = self.i32()?;
-                let mut v = Vec::with_capacity(n.max(0) as usize);
+                if n < 0 || (n as usize) > self.buf.len().saturating_sub(self.pos) {
+                    return Err("invalid composition length".to_string());
+                }
+                let mut v = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     v.push(self.read()?);
                 }
@@ -643,6 +660,10 @@ pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
     if usize_total < 8 {
         return Err("bad uncompressed size".to_string());
     }
+    const MAX_UNCOMPRESSED_SIZE: usize = 1024 * 1024 * 1024; // 1GB limit
+    if usize_total > MAX_UNCOMPRESSED_SIZE {
+        return Err(format!("uncompressed size {} exceeds 1GB limit", usize_total));
+    }
     let mut dst = vec![0u8; usize_total - 8];
     let mut aa = [0usize; 256];
     let mut s = 0usize; // write index into dst
@@ -753,5 +774,28 @@ mod tests {
         let src = [100u8, 0, 0, 0, 0x01, 5]; // control bit set but no ref bytes
         assert!(decompress(&src, true).is_err());
         assert!(decompress(&[1u8], true).is_err()); // too short for the size word
+    }
+
+    #[test]
+    fn decompress_over_1gb_is_err() {
+        // Size word claiming 2GB
+        let src = [0x00, 0x00, 0x00, 0x80, 0x00, 1, 2, 3];
+        assert!(decompress(&src, true).is_err());
+    }
+
+    #[test]
+    fn sym_unterminated_returns_err() {
+        // -11 (symbol atom), followed by "abc" with NO null terminator
+        let buf = [245u8, b'a', b'b', b'c'];
+        assert!(Reader::new(&buf, true).read().is_err());
+    }
+
+    #[test]
+    fn vhdr_exceeding_buffer_returns_err_not_oom() {
+        // Type 1 (bool vector): type=1, attr=0, count=0x7fffffff (2 billion) but payload has only 4 bytes
+        let mut buf = vec![1u8, 0u8];
+        buf.extend_from_slice(&i32::MAX.to_le_bytes());
+        buf.extend_from_slice(&[1, 0, 1, 0]);
+        assert!(Reader::new(&buf, true).read().is_err());
     }
 }
