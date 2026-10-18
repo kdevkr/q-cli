@@ -651,13 +651,17 @@ pub fn fmt_datetime(v: f64) -> String {
     if v.is_infinite() {
         return (if v.is_sign_positive() { "0Wz" } else { "-0Wz" }).into();
     }
-    let nanos = (v * 86_400_000_000_000.0).round() as i64;
-    let (days, h, mi, s, ns) = hms_nanos(nanos);
+    let days = v.floor() as i64;
+    let frac = (v - v.floor()).abs();
     let (y, m, d) = civil(days);
-    let ms = ns / 1_000_000;
+    let ms = ((frac * 86_400_000.0).round() as u64).min(86_399_999);
+    let h = ms / 3_600_000;
+    let mi = (ms % 3_600_000) / 60_000;
+    let s = (ms % 60_000) / 1000;
+    let rem_ms = ms % 1000;
     format!(
         "{:04}.{:02}.{:02}T{:02}:{:02}:{:02}.{:03}",
-        y, m, d, h, mi, s, ms
+        y, m, d, h, mi, s, rem_ms
     )
 }
 

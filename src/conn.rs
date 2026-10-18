@@ -69,6 +69,7 @@ impl Conn {
         stream.set_read_timeout(Some(handshake_timeout)).ok();
         stream.set_write_timeout(Some(handshake_timeout)).ok();
 
+        stream.set_nodelay(true).ok();
         let mut c = Conn { stream };
         c.handshake(&creds)?;
 
@@ -103,6 +104,9 @@ impl Conn {
     /// Send a q expression as a sync request and return the deserialized result.
     pub fn sync(&mut self, expr: &str) -> Result<K, E> {
         let qb = expr.as_bytes();
+        if qb.len() > i32::MAX as usize {
+            return Err(E::usage("query length exceeds max 2GB IPC limit"));
+        }
         let mut body = Vec::with_capacity(6 + qb.len());
         body.push(10);
         body.push(0);
@@ -127,6 +131,12 @@ impl Conn {
         self.stream
             .read_exact(&mut hdr)
             .map_err(|e| io_err("no response header", &e))?;
+        if hdr[2] > 1 {
+            return Err(E::connect(format!(
+                "unsupported compression flag 0x{:02x} in response header",
+                hdr[2]
+            )));
+        }
         let le = hdr[0] == 1;
         let compressed = hdr[2] == 1;
         let len = if le {

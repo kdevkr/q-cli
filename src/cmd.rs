@@ -527,13 +527,23 @@ fn render_output(k: &K, opts: &Opts) -> R {
     })
 }
 
+fn prepare_stmt_for_block(stmt: &str) -> String {
+    let t = stmt.trim();
+    if t.starts_with('\\') {
+        let cmd = t[1..].trim();
+        format!("system \"{}\"", q_escape(cmd))
+    } else {
+        stmt.to_string()
+    }
+}
+
 fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
     let mut c = Conn::open(conn, opts.timeout)?;
     if opts.readonly {
         inspect_remote_funcs(&mut c, expr, 5)?;
     }
     let expr_scoped = if opts.scoped {
-        format!("{{[]\n{}\n}}[]", expr)
+        format!("{{[]\n{}\n}}[]", prepare_stmt_for_block(expr))
     } else {
         expr.to_string()
     };
@@ -576,7 +586,7 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
 
     let joined_stmts = stmts
         .iter()
-        .map(|s| s.text.as_str())
+        .map(|s| prepare_stmt_for_block(&s.text))
         .collect::<Vec<_>>()
         .join(";\n");
 
@@ -619,7 +629,7 @@ fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
     for (idx, s) in stmts.iter().enumerate() {
         let is_last = idx + 1 == stmts.len();
         let to_send = if opts.scoped {
-            format!("{{[]\n{}\n}}[]", s.text)
+            format!("{{[]\n{}\n}}[]", prepare_stmt_for_block(&s.text))
         } else {
             s.text.clone()
         };
@@ -673,38 +683,6 @@ pub fn finish(result: R, opts: &Opts) -> i32 {
             e.kind.code()
         }
     }
-}
-
-/// Blank out the contents of q double-quoted string literals so the readonly
-/// scan matches keywords in *code*, not in *data* — e.g. `like "*delete*"` must
-/// not trip the `delete` denylist. Backslash escapes inside a string are
-/// honoured. (A symbol literal like `` `delete `` is still scanned — rare, and
-/// erring toward over-blocking is the safe default for a readonly guard.)
-#[cfg(test)]
-fn strip_q_strings(expr: &str) -> String {
-    let mut out = String::with_capacity(expr.len());
-    let mut chars = expr.chars();
-    let mut in_str = false;
-    while let Some(c) = chars.next() {
-        if in_str {
-            match c {
-                '\\' => {
-                    chars.next(); // skip the escaped char (e.g. \" or \\)
-                }
-                '"' => {
-                    in_str = false;
-                    out.push('"');
-                }
-                _ => {} // drop the string's contents
-            }
-        } else if c == '"' {
-            in_str = true;
-            out.push('"');
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Strip both string contents and comments (line comments, inline comments, block comments)
@@ -1090,9 +1068,16 @@ mod tests {
 
     #[test]
     fn strip_keeps_code_drops_string_contents() {
-        assert_eq!(strip_q_strings("a\"delete\"b"), "a\"\"b");
-        assert_eq!(strip_q_strings("like \"*x\\\"y*\""), "like \"\"");
-        assert_eq!(strip_q_strings("no strings here"), "no strings here");
+        assert_eq!(strip_q_code("a\"delete\"b").trim(), "a\"\"b");
+        assert_eq!(strip_q_code("like \"*x\\\"y*\"").trim(), "like \"\"");
+        assert_eq!(strip_q_code("no strings here").trim(), "no strings here");
+    }
+
+    #[test]
+    fn prepare_stmt_for_block_converts_backslash() {
+        assert_eq!(prepare_stmt_for_block("\\c 25 120"), "system \"c 25 120\"");
+        assert_eq!(prepare_stmt_for_block("\\p 5000"), "system \"p 5000\"");
+        assert_eq!(prepare_stmt_for_block("select from t"), "select from t");
     }
 
     #[test]
