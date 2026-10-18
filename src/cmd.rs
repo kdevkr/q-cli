@@ -474,7 +474,7 @@ fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result
            denied:`delete`update`insert`upsert`set`hdel`hopen`hclose`system`exit`dpft`dpfts`rename`value`get`eval`save`load`rsave`rload`dsave;\n\
            visited:()!();\n\
            violator:\"\";\n\
-           queue:distinct syms;\n\
+           queue:distinct (),syms;\n\
            steps:0;\n\
            max_steps:max_d * 20;\n\
            while[(steps < max_steps) and (count queue) and 0 = count violator;\n\

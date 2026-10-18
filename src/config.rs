@@ -281,6 +281,30 @@ fn list() -> Result<String, String> {
 
 /// Add or update one entry in `target`, preserving existing lines and comments.
 fn add(target: &Path, name: &str, conn: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("profile name cannot be empty".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "invalid profile name '{}' (must contain only alphanumeric characters, '-', or '_')",
+            name
+        ));
+    }
+    let conn = conn.trim();
+    if conn.is_empty() {
+        return Err("connection target cannot be empty".to_string());
+    }
+    if conn.contains(':') {
+        crate::conn::parse_conn(conn)
+            .map_err(|e| format!("invalid connection string '{}': {}", conn, e.msg))?;
+    } else if !conn.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "invalid alias target '{}' (must be a valid profile name or host:port)",
+            conn
+        ));
+    }
+
     if let Some(dir) = target.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
@@ -424,5 +448,17 @@ mod tests {
             "cluster:5000"
         );
         assert_eq!(resolve_alias("@default", &servers).unwrap(), "cluster:5000");
+    }
+
+    #[test]
+    fn add_validation_rejects_invalid_names_and_conns() {
+        let dummy = Path::new("dummy.conf");
+        assert!(add(dummy, "bad:name", "localhost:5000").is_err());
+        assert!(add(dummy, "bad name", "localhost:5000").is_err());
+        assert!(add(dummy, "bad=name", "localhost:5000").is_err());
+        assert!(add(dummy, "", "localhost:5000").is_err());
+        assert!(add(dummy, "good-name_1", "localhost:not_a_port").is_err());
+        assert!(add(dummy, "good-name_1", "bad alias with spaces").is_err());
+        assert!(add(dummy, "good-name_1", "").is_err());
     }
 }

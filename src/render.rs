@@ -311,7 +311,7 @@ fn render_dict(keys: &K, vals: &K, max: usize) -> String {
         let kstr = scalar_to_string(&at(keys, i));
         let v = at(vals, i);
         if table_parts(&v).is_some() || matches!(v, K::Dict(_, _)) {
-            lines.push(format!("{}|", kstr));
+            lines.push(format!("{}|", pad(&kstr, kw)));
             for l in to_text(&v, max).lines() {
                 lines.push(format!("  {}", l));
             }
