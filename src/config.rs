@@ -245,8 +245,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
 fn write_config_file(target: &Path, content: &str) -> Result<(), String> {
     if let Some(dir) = target.parent() {
         if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)
-                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
     }
     fs::write(target, content).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
@@ -346,9 +345,7 @@ fn add(target: &Path, name: &str, conn_str: &str) -> Result<String, String> {
     if conn_str.is_empty() {
         return Err("connection target cannot be empty".to_string());
     }
-    if conn_str.chars().any(char::is_control)
-        || conn_str.contains(" #")
-        || conn_str.contains("\t#")
+    if conn_str.chars().any(char::is_control) || conn_str.contains(" #") || conn_str.contains("\t#")
     {
         return Err(
             "invalid connection target (cannot contain control characters or inline comments)"
@@ -356,8 +353,12 @@ fn add(target: &Path, name: &str, conn_str: &str) -> Result<String, String> {
         );
     }
     if conn_str.contains(':') {
-        conn::parse_conn(conn_str)
-            .map_err(|e| format!("invalid connection string '{conn_str}': {}", e.msg))?;
+        conn::parse_conn(conn_str).map_err(|_| {
+            format!(
+                "invalid connection string '{}': expected host:port[:user:pass] with a valid port",
+                mask(conn_str)
+            )
+        })?;
     } else {
         let alias = conn_str.strip_prefix('@').unwrap_or(conn_str);
         let valid_alias = !alias.is_empty()
@@ -382,7 +383,7 @@ fn add(target: &Path, name: &str, conn_str: &str) -> Result<String, String> {
     };
 
     let mut replaced = false;
-    for line in &mut lines {
+    for line in lines.iter_mut().rev() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
@@ -427,6 +428,8 @@ fn mask(conn_str: &str) -> String {
         } else {
             conn_str.to_string()
         }
+    } else if conn_str.contains(':') {
+        "<invalid connection>".to_string()
     } else {
         conn_str.to_string()
     }
@@ -478,10 +481,7 @@ mod tests {
         servers.insert("dev".into(), "remote".into());
         servers.insert("remote".into(), "cluster:5000".into());
 
-        assert_eq!(
-            resolve_alias("default", &servers).unwrap(),
-            "cluster:5000"
-        );
+        assert_eq!(resolve_alias("default", &servers).unwrap(), "cluster:5000");
         assert_eq!(resolve_alias("dev", &servers).unwrap(), "cluster:5000");
     }
 
@@ -502,14 +502,8 @@ mod tests {
         servers.insert("local".into(), "@remote".into());
         servers.insert("remote".into(), "cluster:5000".into());
 
-        assert_eq!(
-            resolve_alias("default", &servers).unwrap(),
-            "cluster:5000"
-        );
-        assert_eq!(
-            resolve_alias("@default", &servers).unwrap(),
-            "cluster:5000"
-        );
+        assert_eq!(resolve_alias("default", &servers).unwrap(), "cluster:5000");
+        assert_eq!(resolve_alias("@default", &servers).unwrap(), "cluster:5000");
     }
 
     #[test]
@@ -527,14 +521,63 @@ mod tests {
         assert!(add(&dummy, "good-name_1", "@target_alias").is_ok());
         assert!(add(&dummy, "good-name_1", "target_alias").is_ok());
         assert!(run(&["list".into(), "extra".into()]).is_err());
-        assert!(run(&["add".into(), "a".into(), "localhost:5000".into(), "extra".into()]).is_err());
+        assert!(run(&[
+            "add".into(),
+            "a".into(),
+            "localhost:5000".into(),
+            "extra".into()
+        ])
+        .is_err());
         let _ = fs::remove_file(&dummy);
+    }
+
+    #[test]
+    fn invalid_connection_errors_do_not_expose_credentials() {
+        let target = std::env::temp_dir().join("q-cli-invalid-connection-unused.conf");
+        for conn in [
+            "localhost:bad:alice:review-secret",
+            "[::1:5000:alice:review-secret",
+            "[]:5000:alice:review-secret",
+            "localhost:review-secret",
+        ] {
+            let err = add(&target, "prod", conn).unwrap_err();
+            assert!(!err.contains("review-secret"), "{err}");
+            assert!(err.contains("<invalid connection>"), "{err}");
+        }
+        assert_eq!(mask("prod"), "prod");
+    }
+
+    #[test]
+    fn add_updates_last_duplicate_entry() {
+        let target =
+            std::env::temp_dir().join(format!("q-cli-duplicate-test-{}.conf", std::process::id()));
+        fs::write(
+            &target,
+            "# profiles\nprod = localhost:1111\nother = localhost:4444\n prod = localhost:2222\n",
+        )
+        .unwrap();
+
+        let result = add(&target, "prod", "localhost:3333");
+        let content = fs::read_to_string(&target);
+        fs::remove_file(&target).unwrap();
+
+        assert!(result.is_ok());
+        let content = content.unwrap();
+        assert_eq!(parse(&content).get("prod").unwrap(), "localhost:3333");
+        assert_eq!(
+            content,
+            "# profiles\nprod = localhost:1111\nother = localhost:4444\nprod = localhost:3333\n"
+        );
     }
 
     #[test]
     fn global_path_resolution() {
         assert_eq!(
-            global_path_from(Some("/custom/path/servers.conf"), Some("/xdg"), Some("/home")),
+            global_path_from(
+                Some("/custom/path/servers.conf"),
+                Some("/xdg"),
+                Some("/home")
+            ),
             PathBuf::from("/custom/path/servers.conf")
         );
         assert_eq!(

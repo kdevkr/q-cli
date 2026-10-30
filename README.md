@@ -60,6 +60,10 @@ q-cli config list                    # merged view, each entry tagged [global]/[
 q-cli config path                    # show both layers and which project file is active
 ```
 
+Only use project profiles from trusted directories. A repository's `.q-cli.conf`
+can redirect `@prod` to another host. Set `Q_CLI_CONFIG` to a trusted config file
+to disable project overrides.
+
 **Output modes & flags** (default: aligned text, or `Q_CLI_OUT=text|json|csv|console`):
 - `--text` — aligned text table/value output (default; overrides `Q_CLI_OUT`).
 - `--json` / `-j` — JSON. Tables → array of row objects; keyed tables merge
@@ -84,6 +88,13 @@ q-cli config path                    # show both layers and which project file i
   false-blocked. It also blocks the
   server-mutating `web off`/`web get-ok` and `trace on`/`trace off` (which rebind
   `.z.*` handlers); the `status` forms stay allowed.
+  Computed bracket calls such as `(0)[...]` and chained `f[][ ... ]` calls are
+  rejected. Bracket calls on identifiers inside lambdas are also rejected because
+  an argument or local can hold an IPC handle. This includes local array indexing;
+  parenthesized calls and direct string calls inside lambdas are restricted too.
+  Prefix calls such as `{x y}[0;"..."]` inside lambdas are rejected, including
+  ordinary prefix calls such as `{sum x}[1 2]`. Simple lambdas such as `{x+1}[1]`
+  remain supported.
 - `--scoped` — wrap evaluations (`query`/`time`/`run`) in `{[] ... }[]` so temporary
   assignments stay local and never pollute server globals.
 - `--atomic` — execute a `.q` script (`run`) as a single protected IPC evaluation
@@ -130,17 +141,39 @@ ERR q error 'type
          ^
   [2]  {x+`a}[1]
 ```
-`trace off` restores the default handlers; `trace status` shows them. Runtime-only;
-the equivalent startup line is:
-```q
-.z.pg:.z.ps:{.Q.trp[value;x;{-2 .Q.sbt y;'x,"\n",.Q.sbt y}]};
-```
+`trace on` wraps the existing `.z.pg` and `.z.ps` handlers, so their authorization
+checks still run. `trace off` restores those handlers, including an unset default.
+Repeated `on` calls preserve the first saved handlers; `off` without active tracing
+leaves the server alone. If another tool replaces either handler during tracing,
+`on` and `off` fail instead of overwriting that change.
+
+Trace state is runtime-only and uses the reserved server symbol `.qcli.traceState`.
+Do not modify that symbol while tracing. `trace status` shows the current handlers.
 
 - Errors print `ERR ...` on stderr with a non-zero exit (see exit codes above); a
   q-side error shows as `ERR q error '<msg>`.
 - `localhost` tries both `::1` and `127.0.0.1` (a q server `-p N` binds IPv4 only).
 
 ## How it works
+
+### Server-side access control
+
+Use server-side authentication and authorization as the primary protection.
+The client's `--readonly` checks are a supplementary guard and cannot secure a
+server that accepts arbitrary q expressions.
+
+- Start q with `-U <password-file>` for user/password authentication, or
+  `-u <password-file>` to add restrictions on remote system and file operations.
+  These options do not by themselves make every query read-only.
+- Enforce an allowlist of approved read-only operations in `.z.pg` for synchronous
+  requests and `.z.ps` for asynchronous requests. Keep these authorization handlers
+  in the server startup configuration.
+
+See the KX documentation for [command-line security options](https://code.kx.com/q/basics/cmdline/)
+and [IPC authentication and authorization](https://code.kx.com/q/basics/ipc/).
+
+### Request flow
+
 1. **Handshake** — TCP connect, send `creds + \x03\x00`, read 1-byte capability.
 2. **Sync query** — serialize the expression as a char vector (type 10) inside a
    sync message (`msgtype=1`), send, read the 8-byte response header + payload.

@@ -464,7 +464,8 @@ pub fn to_csv(val: &K) -> String {
         out.push_str(&row.join(","));
         out.push('\n');
     }
-    out.trim_end().to_string()
+    out.pop();
+    out
 }
 
 fn csv_field(s: &str) -> String {
@@ -715,6 +716,24 @@ mod tests {
     }
 
     #[test]
+    fn csv_preserves_trailing_whitespace_and_empty_rows() {
+        for (values, expected) in [
+            (vec!["abc \t"], "s\nabc \t"),
+            (vec!["abc", "", ""], "s\nabc\n\n"),
+            (vec![""], "s\n"),
+            (vec![], "s"),
+        ] {
+            let table = K::Table(Box::new(K::Dict(
+                Box::new(K::SymbolV(vec!["s".to_string()])),
+                Box::new(K::List(vec![K::SymbolV(
+                    values.into_iter().map(str::to_string).collect(),
+                )])),
+            )));
+            assert_eq!(to_csv(&table), expected);
+        }
+    }
+
+    #[test]
     fn json_respects_max_rows() {
         assert_eq!(to_json(&sample_table(), 1), r#"[{"a":1,"b":"x"}]"#);
     }
@@ -863,10 +882,7 @@ mod tests {
             to_json(&table, 0),
             r#"[{"id":1,"msg":"hello","d":null},{"id":2,"msg":"a,b","d":"2000.01.01"}]"#
         );
-        assert_eq!(
-            to_text(&K::DateV(vec![NULL_INT, 0]), 0),
-            "0Nd 2000.01.01"
-        );
+        assert_eq!(to_text(&K::DateV(vec![NULL_INT, 0]), 0), "0Nd 2000.01.01");
     }
 
     #[test]

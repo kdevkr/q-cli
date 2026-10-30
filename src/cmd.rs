@@ -46,8 +46,8 @@ pub struct Opts {
     pub max_rows: usize, // 0 = unlimited
     pub readonly: bool,
     pub scoped: bool,
-    pub atomic: bool,  // execute entire script in a single atomic block
-    pub dry_run: bool, // validate syntax on server without mutating state
+    pub atomic: bool,              // execute entire script in a single atomic block
+    pub dry_run: bool,             // validate syntax on server without mutating state
     pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
@@ -219,8 +219,7 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
             opts,
         );
     }
-    let supports_script_flags =
-        matches!(cmd.spec, Spec::Run) || matches!(mode, "query" | "time");
+    let supports_script_flags = matches!(cmd.spec, Spec::Run) || matches!(mode, "query" | "time");
     if opts.dry_run && !supports_script_flags {
         return finish(
             Err(CliError::usage(
@@ -709,13 +708,35 @@ fn web_expr(action: &str) -> CmdResult {
     })
 }
 
-/// `trace <on|off|status>` — wrap .z.pg/.z.ps with .Q.trp so query errors return
-/// a .Q.sbt backtrace (and print it to the server console).
+/// Preserve the original IPC handlers while tracing, including absent defaults.
 fn trace_expr(action: &str) -> CmdResult {
-    const H: &str = "{.Q.trp[value;x;{-2 .Q.sbt y;'x,\"\\n\",.Q.sbt y}]}";
+    const WRAP: &str = "{[handler;request] .Q.trp[handler;request;\
+        {-2 .Q.sbt y;'x,\"\\n\",.Q.sbt y}]}";
+    const CHECK: &str = "state:.qcli.traceState; \
+        if[not \"q-cli trace v1\"~state`owner; \
+          '\"q-cli trace state name already in use\"]; \
+        current:{@[value;x;{::}]} each `.z.pg`.z.ps; \
+        if[not current~state`wrapped; \
+          '\"trace handlers changed; refusing to overwrite them\"];";
     Ok(match action {
-        "on" => format!(".z.pg:{H};.z.ps:{H};\"trace: on\""),
-        "off" => ".z.pg:value;.z.ps:value;\"trace: off\"".to_string(),
+        "on" => format!(
+            "{{[] if[`traceState in key `.qcli; {CHECK} :\"trace: on\"]; \
+             present:{{@[{{value x;1b}};x;{{0b}}]}} each `.z.pg`.z.ps; \
+             saved:{{@[value;x;{{value}}]}} each `.z.pg`.z.ps; \
+             wrapped:({WRAP}[saved 0;];{WRAP}[saved 1;]); \
+             `.qcli.traceState set `owner`present`handlers`wrapped!\
+               (\"q-cli trace v1\";present;saved;wrapped); \
+             .z.pg:wrapped 0; .z.ps:wrapped 1; \"trace: on\"}}[]"
+        ),
+        "off" => format!(
+            "{{[] if[not `traceState in key `.qcli; :\"trace: off\"]; \
+             {CHECK} \
+             if[state[`present]0; .z.pg:state[`handlers]0]; \
+             if[not state[`present]0; system \"x .z.pg\"]; \
+             if[state[`present]1; .z.ps:state[`handlers]1]; \
+             if[not state[`present]1; system \"x .z.ps\"]; \
+             delete traceState from `.qcli; \"trace: off\"}}[]"
+        ),
         "status" => "`pg`ps!(@[{string value x};`.z.pg;\"(default)\"];\
                      @[{string value x};`.z.ps;\"(default)\"])"
             .to_string(),
@@ -743,7 +764,7 @@ fn is_builtin_or_keyword(name: &str) -> bool {
         "type", "upper", "lower", "trim", "ltrim", "rtrim", "sv", "vs", "ss", "ssr", "raze",
         "enlist", "flip", "i", "mod", "div", "cross", "cut", "md5", "except", "inter", "union",
     ];
-    BUILTINS.contains(&name.to_lowercase().as_str())
+    BUILTINS.contains(&name)
 }
 
 fn extract_candidate_func_names(expr: &str) -> Vec<String> {
@@ -1177,8 +1198,7 @@ fn tokenize_for_readonly(src: &str) -> Vec<QTok> {
         if c == '`' {
             i += 1;
             while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric()
-                    || matches!(chars[i], '_' | '.' | ':' | '`'))
+                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '.' | ':' | '`'))
             {
                 i += 1;
             }
@@ -1186,8 +1206,7 @@ fn tokenize_for_readonly(src: &str) -> Vec<QTok> {
             continue;
         }
 
-        if c.is_ascii_digit()
-            || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
+        if c.is_ascii_digit() || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
         {
             i += 1;
             while i < chars.len()
@@ -1270,11 +1289,13 @@ fn tokenize_for_readonly(src: &str) -> Vec<QTok> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            let lower = word.to_lowercase();
-            match lower.as_str() {
+            match word.as_str() {
                 "select" => tokens.push(QTok::Select),
                 "exec" => tokens.push(QTok::Exec),
                 "from" => tokens.push(QTok::From),
+                "where" | "by" | "in" | "within" | "like" | "and" | "or" => {
+                    tokens.push(QTok::Other);
+                }
                 _ => tokens.push(QTok::Ident(word)),
             }
             continue;
@@ -1336,7 +1357,9 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
             )));
         }
     }
-    for sys_var in [".z.ps", ".z.pg", ".z.ph", ".z.pp", ".z.po", ".z.pc", ".q.trp"] {
+    for sys_var in [
+        ".z.ps", ".z.pg", ".z.ph", ".z.pp", ".z.po", ".z.pc", ".q.trp",
+    ] {
         if lower.contains(sys_var) {
             return Err(CliError::usage(&format!(
                 "readonly: blocked '{sys_var}'; unset --readonly / Q_CLI_READONLY to allow"
@@ -1411,9 +1434,8 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                     while after < chars.len() && chars[after].is_ascii_whitespace() {
                         after += 1;
                     }
-                    let is_empty_cast = after + 1 < chars.len()
-                        && chars[after] == '('
-                        && chars[after + 1] == ')';
+                    let is_empty_cast =
+                        after + 1 < chars.len() && chars[after] == '(' && chars[after + 1] == ')';
                     if !is_empty_cast {
                         return Err(CliError::usage(
                             "readonly: blocked dynamic symbol cast ('$'); \
@@ -1445,8 +1467,7 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                 }
                 let mut w_start = before;
                 while w_start > 0
-                    && (chars[w_start - 1].is_ascii_alphabetic()
-                        || chars[w_start - 1] == '_')
+                    && (chars[w_start - 1].is_ascii_alphabetic() || chars[w_start - 1] == '_')
                 {
                     w_start -= 1;
                 }
@@ -1494,8 +1515,9 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
     for tok in &tokens {
         match tok {
             QTok::Ident(name) => {
-                if matches!(prev_token, Some(QTok::NumberLit))
-                    && !is_builtin_or_keyword(name)
+                if (matches!(prev_token, Some(QTok::NumberLit)) && !is_builtin_or_keyword(name))
+                    || (brace_depth > 0
+                        && matches!(prev_token, Some(QTok::Ident(_) | QTok::CloseParen)))
                 {
                     return Err(CliError::usage(
                         "readonly: blocked potential IPC handle invocation; \
@@ -1514,19 +1536,49 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                     let prev_is_safe_str_op = match prev {
                         QTok::Ident(w) => {
                             matches!(
-                                w.to_lowercase().as_str(),
-                                "like" | "ss" | "ssr" | "vs" | "sv" | "enlist" | "raze"
-                                    | "count" | "first" | "last" | "reverse" | "upper"
-                                    | "lower" | "trim" | "ltrim" | "rtrim" | "string"
-                                    | "type" | "null" | "distinct" | "group" | "in" | "within"
-                                    | "except" | "inter" | "union" | "cross" | "asc" | "desc"
-                                    | "iasc" | "idesc" | "md5" | "cut"
+                                w.as_str(),
+                                "like"
+                                    | "ss"
+                                    | "ssr"
+                                    | "vs"
+                                    | "sv"
+                                    | "enlist"
+                                    | "raze"
+                                    | "count"
+                                    | "first"
+                                    | "last"
+                                    | "reverse"
+                                    | "upper"
+                                    | "lower"
+                                    | "trim"
+                                    | "ltrim"
+                                    | "rtrim"
+                                    | "string"
+                                    | "type"
+                                    | "null"
+                                    | "distinct"
+                                    | "group"
+                                    | "in"
+                                    | "within"
+                                    | "except"
+                                    | "inter"
+                                    | "union"
+                                    | "cross"
+                                    | "asc"
+                                    | "desc"
+                                    | "iasc"
+                                    | "idesc"
+                                    | "md5"
+                                    | "cut"
                             )
                         }
                         _ => false,
                     };
-                    if matches!(prev, QTok::NumberLit | QTok::CloseParen | QTok::CloseBrace)
-                        || (matches!(prev, QTok::Ident(_)) && !prev_is_safe_str_op)
+                    if matches!(
+                        prev,
+                        QTok::NumberLit | QTok::CloseParen | QTok::CloseBracket | QTok::CloseBrace
+                    ) || (matches!(prev, QTok::Ident(_))
+                        && (brace_depth > 0 || !prev_is_safe_str_op))
                     {
                         return Err(CliError::usage(
                             "readonly: blocked potential IPC handle or dynamic string call; \
@@ -1547,8 +1599,12 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                 }
             }
             QTok::OpenBracket => {
-                // Check if preceded by a NumberLit (e.g. 0["query"])
-                if matches!(prev_token, Some(QTok::NumberLit)) {
+                // A computed value or lambda argument can be an IPC handle.
+                if matches!(
+                    prev_token,
+                    Some(QTok::NumberLit | QTok::CloseParen | QTok::CloseBracket)
+                ) || (brace_depth > 0 && matches!(prev_token, Some(QTok::Ident(_))))
+                {
                     return Err(CliError::usage(
                         "readonly: blocked potential IPC handle invocation; \
                          unset --readonly / Q_CLI_READONLY to allow",
@@ -1558,8 +1614,9 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                 in_projection = false;
             }
             QTok::OpenParen => {
-                // Check if preceded by a NumberLit (e.g. 0("query"))
-                if matches!(prev_token, Some(QTok::NumberLit)) {
+                if matches!(prev_token, Some(QTok::NumberLit))
+                    || (brace_depth > 0 && matches!(prev_token, Some(QTok::Ident(_))))
+                {
                     return Err(CliError::usage(
                         "readonly: blocked potential IPC handle invocation; \
                          unset --readonly / Q_CLI_READONLY to allow",
@@ -1578,59 +1635,53 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
                     in_projection = false;
                 }
             }
-            QTok::DoubleColon => {
-                match prev_token {
-                    Some(QTok::Ident(name)) => {
-                        return Err(CliError::usage(&format!(
-                            "readonly: blocked global assignment ('{name}::'); \
+            QTok::DoubleColon => match prev_token {
+                Some(QTok::Ident(name)) => {
+                    return Err(CliError::usage(&format!(
+                        "readonly: blocked global assignment ('{name}::'); \
                              unset --readonly / Q_CLI_READONLY to allow"
-                        )));
-                    }
-                    Some(QTok::CloseBracket | QTok::CloseParen) => {
-                        return Err(CliError::usage(
-                            "readonly: blocked global assignment ('::'); \
+                    )));
+                }
+                Some(QTok::CloseBracket | QTok::CloseParen) => {
+                    return Err(CliError::usage(
+                        "readonly: blocked global assignment ('::'); \
                              unset --readonly / Q_CLI_READONLY to allow",
-                        ));
-                    }
-                    _ => {}
+                    ));
                 }
-            }
-            QTok::CompoundColon(op) => {
-                match prev_token {
-                    Some(QTok::Ident(name)) => {
-                        return Err(CliError::usage(&format!(
-                            "readonly: blocked compound assignment ('{name}{op}:'); \
+                _ => {}
+            },
+            QTok::CompoundColon(op) => match prev_token {
+                Some(QTok::Ident(name)) => {
+                    return Err(CliError::usage(&format!(
+                        "readonly: blocked compound assignment ('{name}{op}:'); \
                              unset --readonly / Q_CLI_READONLY to allow"
-                        )));
-                    }
-                    Some(QTok::CloseBracket | QTok::CloseParen) => {
-                        return Err(CliError::usage(&format!(
-                            "readonly: blocked compound assignment ('{op}:'); \
-                             unset --readonly / Q_CLI_READONLY to allow"
-                        )));
-                    }
-                    _ => {}
+                    )));
                 }
-            }
-            QTok::Colon => {
-                match prev_token {
-                    Some(QTok::Ident(name))
-                        if name.contains('.') || (!in_projection && brace_depth == 0) =>
-                    {
-                        return Err(CliError::usage(&format!(
-                            "readonly: blocked assignment ('{name}:'); \
+                Some(QTok::CloseBracket | QTok::CloseParen) => {
+                    return Err(CliError::usage(&format!(
+                        "readonly: blocked compound assignment ('{op}:'); \
                              unset --readonly / Q_CLI_READONLY to allow"
-                        )));
-                    }
-                    Some(QTok::CloseBracket | QTok::CloseParen) => {
-                        return Err(CliError::usage(
-                            "readonly: blocked indexed/destructured assignment (':'); \
+                    )));
+                }
+                _ => {}
+            },
+            QTok::Colon => match prev_token {
+                Some(QTok::Ident(name))
+                    if name.contains('.') || (!in_projection && brace_depth == 0) =>
+                {
+                    return Err(CliError::usage(&format!(
+                        "readonly: blocked assignment ('{name}:'); \
+                             unset --readonly / Q_CLI_READONLY to allow"
+                    )));
+                }
+                Some(QTok::CloseBracket | QTok::CloseParen) => {
+                    return Err(CliError::usage(
+                        "readonly: blocked indexed/destructured assignment (':'); \
                              unset --readonly / Q_CLI_READONLY to allow",
-                        ));
-                    }
-                    _ => {}
+                    ));
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
         prev_token = Some(tok);
@@ -1816,6 +1867,77 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Q_CLI_TEST_Q pointing to a licensed q executable"]
+    fn trace_preserves_handlers_on_a_real_q_process() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let executable = std::env::var_os("Q_CLI_TEST_Q").expect("set Q_CLI_TEST_Q");
+        let on = trace_expr("on").expect("valid action");
+        let off = trace_expr("off").expect("valid action");
+        let commands = [
+            "system \"x .z.pg\";system \"x .z.ps\"",
+            &off,
+            &on,
+            &on,
+            "if[not 2~.z.pg[\"1+1\"]; '\"default handler changed\"]",
+            &off,
+            &off,
+            "if[any {@[{value x;1b};x;{0b}]} each `.z.pg`.z.ps; \
+              '\"absent handlers were not restored\"]",
+            ".z.pg:{[request] 99};.z.ps:{[request] 98}",
+            "originalPg:.z.pg;originalPs:.z.ps",
+            &on,
+            &on,
+            "if[not 99~.z.pg[\"1+1\"]; '\"sync policy bypassed\"]",
+            "if[not 98~.z.ps[\"1+1\"]; '\"async policy bypassed\"]",
+            &off,
+            &off,
+            "if[not originalPg~.z.pg; '\"sync handler not restored\"]",
+            "if[not originalPs~.z.ps; '\"async handler not restored\"]",
+            &on,
+            ".z.ps:{[request] 97}",
+            &format!(
+                "if[not 1b~@[{{{off};0b}};::;{{1b}}]; \
+                 '\"changed async handler overwritten\"]"
+            ),
+            "if[not 97~.z.ps[\"1+1\"]; '\"changed async policy lost\"]",
+            &format!(
+                "if[not 1b~@[{{{on};0b}};::;{{1b}}]; \
+                 '\"changed handler overwritten by repeated on\"]"
+            ),
+            "-1 \"Q_CLI_TRACE_TEST_OK\"",
+        ];
+        let script = format!(
+            ".[{{[]\n{}\n}};();{{-2 x;exit 1}}];\nexit 0\n",
+            commands.join(";\n")
+        );
+        let mut child = Command::new(executable)
+            .arg("-q")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start q");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("send q assertions");
+        let output = child.wait_with_output().expect("wait for q");
+        assert!(
+            output.status.success()
+                && output
+                    .stdout
+                    .windows(b"Q_CLI_TRACE_TEST_OK".len())
+                    .any(|part| part == b"Q_CLI_TRACE_TEST_OK"),
+            "q trace assertions failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn strip_keeps_code_drops_string_contents() {
         assert_eq!(strip_q_code("a\"delete\"b").trim(), "a\"\"b");
         assert_eq!(strip_q_code("like \"*x\\\"y*\"").trim(), "like \"\"");
@@ -1838,30 +1960,61 @@ mod tests {
     }
 
     #[test]
+    fn readonly_blocks_computed_and_lambda_handle_calls() {
+        for expr in [
+            "(0)[\"reviewX:1\"]",
+            "((0))[\"reviewX:1\"]",
+            "{x[\"reviewX:1\"]}[0]",
+            "{x[y]}[0;\"reviewX:1\"]",
+            "{x y}[0;\"reviewX:1\"]",
+            "{(x)y}[0;\"reviewX:1\"]",
+            "{[count]count[\"reviewX:1\"]}[0]",
+            "{x(\"reviewX:1\")}[0]",
+            "{[count]count \"reviewX:1\"}[0]",
+            "(first key .z.W)[\"reviewX:1\"]",
+            "{0}[][\"reviewX:1\"]",
+            "{0}[] \"reviewX:1\"",
+        ] {
+            assert!(check_readonly(expr, &readonly_opts()).is_err(), "{expr}");
+        }
+        for expr in ["{x+1}[1]", "{[x] y:x+1;y*2}[10]", "like[\"abc\";\"a*\"]"] {
+            assert!(check_readonly(expr, &readonly_opts()).is_ok(), "{expr}");
+        }
+    }
+
+    #[test]
+    fn readonly_function_candidates_are_case_sensitive() {
+        assert!(is_builtin_or_keyword("count"));
+        for name in ["COUNT", "Count", "SELECT", "EXEC", "FROM"] {
+            assert!(!is_builtin_or_keyword(name), "{name}");
+            assert_eq!(
+                extract_candidate_func_names(&format!("{name}[]")),
+                vec![name]
+            );
+        }
+    }
+
+    #[test]
     fn readonly_allows_reads_and_string_literal_keywords() {
         assert!(check_readonly("select from t", &readonly_opts()).is_ok());
         // the keyword appears only inside a string literal -> not a mutation
-        assert!(
-            check_readonly("select from t where note like \"*delete*\"", &readonly_opts()).is_ok()
-        );
+        assert!(check_readonly(
+            "select from t where note like \"*delete*\"",
+            &readonly_opts()
+        )
+        .is_ok());
         // symbol literals matching denied names are allowed in read queries
-        assert!(
-            check_readonly("select from log where action = `delete", &readonly_opts()).is_ok()
-        );
-        assert!(
-            check_readonly(
-                "select from log where action = `delete, sym = `AAPL",
-                &readonly_opts()
-            )
-            .is_ok()
-        );
-        assert!(
-            check_readonly(
-                "select from log where action in `insert`update",
-                &readonly_opts()
-            )
-            .is_ok()
-        );
+        assert!(check_readonly("select from log where action = `delete", &readonly_opts()).is_ok());
+        assert!(check_readonly(
+            "select from log where action = `delete, sym = `AAPL",
+            &readonly_opts()
+        )
+        .is_ok());
+        assert!(check_readonly(
+            "select from log where action in `insert`update",
+            &readonly_opts()
+        )
+        .is_ok());
         // Calling a symbol as a function (bracket, prefix, or infix) or handle symbols is blocked
         assert!(check_readonly("`insert[t; (1;2)]", &readonly_opts()).is_err());
         assert!(check_readonly("`set (`t; 1)", &readonly_opts()).is_err());
@@ -1913,40 +2066,47 @@ mod tests {
 
     #[test]
     fn time_command_works_with_readonly_and_blocks_mutations() {
-        let (expr, guard_raw, stmts) =
-            prepare_eval("select from trade", build_time, true, true, &readonly_opts()).unwrap();
+        let (expr, guard_raw, stmts) = prepare_eval(
+            "select from trade",
+            build_time,
+            true,
+            true,
+            &readonly_opts(),
+        )
+        .unwrap();
         assert!(expr.contains(".z.p"));
         assert_eq!(guard_raw.as_deref(), Some("select from trade"));
         assert_eq!(stmts.len(), 1);
 
-        assert!(
-            prepare_eval("delete from trade", build_time, true, true, &readonly_opts()).is_err()
-        );
+        assert!(prepare_eval(
+            "delete from trade",
+            build_time,
+            true,
+            true,
+            &readonly_opts()
+        )
+        .is_err());
         assert!(prepare_eval("   ", build_time, true, true, &readonly_opts()).is_err());
         assert!(prepare_eval("/ only comment", build_query, true, true, &readonly_opts()).is_err());
         assert!(prepare_eval("", build_query, true, true, &readonly_opts()).is_err());
         assert!(prepare_eval("   ", build_query, true, true, &readonly_opts()).is_err());
-        assert!(
-            prepare_eval(
-                "",
-                |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
-                true,
-                false,
-                &readonly_opts()
-            )
-            .is_err()
-        );
+        assert!(prepare_eval(
+            "",
+            |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
+            true,
+            false,
+            &readonly_opts()
+        )
+        .is_err());
         // `gc -` must fail immediately as an unexpected argument, not read stdin
-        assert!(
-            prepare_eval(
-                "-",
-                |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
-                true,
-                false,
-                &Opts::default()
-            )
-            .is_err()
-        );
+        assert!(prepare_eval(
+            "-",
+            |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
+            true,
+            false,
+            &Opts::default()
+        )
+        .is_err());
         assert!(no_extra_arg("extra", "tables").is_err());
         assert!(check_readonly("(`:host:5000) 3: \"1+1\"", &readonly_opts()).is_err());
     }
@@ -2048,13 +2208,11 @@ ignored after eof
 
     #[test]
     fn readonly_allows_select_aliases_comments_and_generic_null() {
-        assert!(
-            check_readonly(
-                "select c: count i, max_p: max price from trade",
-                &readonly_opts()
-            )
-            .is_ok()
-        );
+        assert!(check_readonly(
+            "select c: count i, max_p: max price from trade",
+            &readonly_opts()
+        )
+        .is_ok());
         assert!(check_readonly("exec p: last price from trade", &readonly_opts()).is_ok());
         assert!(check_readonly("(::)", &readonly_opts()).is_ok());
         assert!(check_readonly("f[::; 1]", &readonly_opts()).is_ok());
