@@ -167,6 +167,21 @@ impl Conn {
     }
 }
 
+/// Mask sensitive credentials from a connection string before reporting in error messages.
+fn mask_err_conn(conn: &str) -> String {
+    // If credentials exist (3rd or 4th colon-separated segment), mask them
+    if let Some((target, rest)) = conn.split_once(':') {
+        if target.starts_with('[') && !target.contains(']') {
+            // Unclosed bracket
+            return "<invalid connection>".to_string();
+        }
+        if let Some((_port, _creds)) = rest.split_once(':') {
+            return format!("{target}:<masked>");
+        }
+    }
+    conn.to_string()
+}
+
 /// Parse `host:port[:user:pass]` or `[ipv6]:port[:user:pass]`.
 pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
     if conn.chars().any(char::is_control) {
@@ -174,22 +189,23 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
             "bad connection: contains control characters",
         ));
     }
+    let masked = mask_err_conn(conn);
     let (host, rest) = if let Some(bracketed) = conn.strip_prefix('[') {
         let (h, after) = bracketed.split_once(']').ok_or_else(|| {
-            CliError::usage(&format!("bad connection '{conn}', missing closing ']'"))
+            CliError::usage(&format!("bad connection '{masked}', missing closing ']'"))
         })?;
         if h.is_empty() {
             return Err(CliError::usage(&format!(
-                "bad connection '{conn}', empty bracketed host"
+                "bad connection '{masked}', empty bracketed host"
             )));
         }
         let after = after.strip_prefix(':').ok_or_else(|| {
-            CliError::usage(&format!("bad connection '{conn}', expected port after ']'"))
+            CliError::usage(&format!("bad connection '{masked}', expected port after ']'"))
         })?;
         (h, after)
     } else {
         let (h, after) = conn.split_once(':').ok_or_else(|| {
-            CliError::usage(&format!("bad connection '{conn}', expected host:port"))
+            CliError::usage(&format!("bad connection '{masked}', expected host:port"))
         })?;
         let host = if h.is_empty() { "localhost" } else { h };
         (host, after)
@@ -322,6 +338,14 @@ mod tests {
         assert!(parse_conn("[::1:5000").is_err());
         assert!(parse_conn("[]:5000").is_err());
         assert!(parse_conn("localhost:0").is_err());
+
+        // Verify credentials are never leaked in parse error messages
+        let err1 = parse_conn("[::1]5000:alice:secret").unwrap_err();
+        assert!(!err1.msg.contains("secret"));
+        let err2 = parse_conn("[::1:5000:alice:secret").unwrap_err();
+        assert!(!err2.msg.contains("secret"));
+        let err3 = parse_conn("localhost:badport:alice:secret").unwrap_err();
+        assert!(!err3.msg.contains("secret"));
         assert!(parse_conn("[::1]:0").is_err());
         assert!(parse_conn("localhost:5000:user:pass\ninjected=evil:5000").is_err());
         assert!(parse_conn("localhost:5000:user\0pass").is_err());

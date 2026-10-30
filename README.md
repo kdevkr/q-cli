@@ -145,7 +145,10 @@ ERR q error 'type
 checks still run. `trace off` restores those handlers, including an unset default.
 Repeated `on` calls preserve the first saved handlers; `off` without active tracing
 leaves the server alone. If another tool replaces either handler during tracing,
-`on` and `off` fail instead of overwriting that change.
+`on` and `off` fail instead of overwriting that change (to manually reset, execute
+`delete traceState from `.qcli` on the server).
+Note that tracing wraps message execution with `.Q.trp`, which is intended for debugging;
+detailed backtraces may reveal internal handler stack traces on error.
 
 Trace state is runtime-only and uses the reserved server symbol `.qcli.traceState`.
 Do not modify that symbol while tracing. `trace status` shows the current handlers.

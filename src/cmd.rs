@@ -717,7 +717,8 @@ fn trace_expr(action: &str) -> CmdResult {
           '\"q-cli trace state name already in use\"]; \
         current:{@[value;x;{::}]} each `.z.pg`.z.ps; \
         if[not current~state`wrapped; \
-          '\"trace handlers changed; refusing to overwrite them\"];";
+          '\"trace handlers changed; refusing to overwrite them \
+            (manual reset: delete traceState from `.qcli)\"];";
     Ok(match action {
         "on" => format!(
             "{{[] if[`traceState in key `.qcli; {CHECK} :\"trace: on\"]; \
@@ -1169,6 +1170,8 @@ enum QTok {
     OpenBrace,
     CloseBrace,
     Semi,
+    At,
+    Dot,
     Other,
 }
 
@@ -1273,6 +1276,19 @@ fn tokenize_for_readonly(src: &str) -> Vec<QTok> {
             }
             ';' => {
                 tokens.push(QTok::Semi);
+                i += 1;
+                continue;
+            }
+            '@' => {
+                tokens.push(QTok::At);
+                i += 1;
+                continue;
+            }
+            '.' if chars
+                .get(i + 1)
+                .is_none_or(|&n| n.is_ascii_whitespace() || n == '(' || n == '[') =>
+            {
+                tokens.push(QTok::Dot);
                 i += 1;
                 continue;
             }
@@ -1515,9 +1531,16 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
     for tok in &tokens {
         match tok {
             QTok::Ident(name) => {
-                if (matches!(prev_token, Some(QTok::NumberLit)) && !is_builtin_or_keyword(name))
+                let is_builtin = is_builtin_or_keyword(name);
+                let prev_is_builtin = match prev_token {
+                    Some(QTok::Ident(prev_name)) => is_builtin_or_keyword(prev_name),
+                    _ => false,
+                };
+                if (matches!(prev_token, Some(QTok::NumberLit)) && !is_builtin)
                     || (brace_depth > 0
-                        && matches!(prev_token, Some(QTok::Ident(_) | QTok::CloseParen)))
+                        && matches!(prev_token, Some(QTok::Ident(_) | QTok::CloseParen))
+                        && !is_builtin
+                        && !prev_is_builtin)
                 {
                     return Err(CliError::usage(
                         "readonly: blocked potential IPC handle invocation; \
@@ -1633,6 +1656,23 @@ fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
             QTok::Semi => {
                 if scope_stack.is_empty() {
                     in_projection = false;
+                }
+            }
+            QTok::At | QTok::Dot => {
+                if matches!(
+                    prev_token,
+                    Some(
+                        QTok::NumberLit
+                            | QTok::CloseParen
+                            | QTok::CloseBracket
+                            | QTok::CloseBrace
+                    )
+                ) || (brace_depth > 0 && matches!(prev_token, Some(QTok::Ident(_))))
+                {
+                    return Err(CliError::usage(
+                        "readonly: blocked potential IPC handle invocation via '@' / '.'; \
+                         unset --readonly / Q_CLI_READONLY to allow",
+                    ));
                 }
             }
             QTok::DoubleColon => match prev_token {
@@ -1974,10 +2014,21 @@ mod tests {
             "(first key .z.W)[\"reviewX:1\"]",
             "{0}[][\"reviewX:1\"]",
             "{0}[] \"reviewX:1\"",
+            "0@\"reviewA:1\"",
+            "(0)@\"reviewA:1\"",
+            "{x@y}[0;\"reviewA:1\"]",
+            "0 . enlist \"reviewA:1\"",
+            "(first key .z.W)@\"reviewA:1\"",
         ] {
             assert!(check_readonly(expr, &readonly_opts()).is_err(), "{expr}");
         }
-        for expr in ["{x+1}[1]", "{[x] y:x+1;y*2}[10]", "like[\"abc\";\"a*\"]"] {
+        for expr in [
+            "{x+1}[1]",
+            "{[x] y:x+1;y*2}[10]",
+            "like[\"abc\";\"a*\"]",
+            "{sum x}[1 2]",
+            "exec {count x} each sym from t",
+        ] {
             assert!(check_readonly(expr, &readonly_opts()).is_ok(), "{expr}");
         }
     }
