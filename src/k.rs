@@ -1,5 +1,12 @@
 //! kdb+ K object model, wire deserialization, and temporal formatting.
 
+/// Byte order of a kdb+ IPC message payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
 /// A deserialized q value. Only the types a CLI realistically encounters are
 /// modelled; anything else surfaces as an explicit error.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,72 +70,87 @@ fn safe_cap(n: usize) -> usize {
 }
 
 /// Cursor over a response payload.
+#[derive(Debug, Clone)]
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
-    le: bool,
+    endian: Endian,
     depth: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(buf: &'a [u8], le: bool) -> Self {
-        Reader { buf, pos: 0, le, depth: 0 }
+    #[must_use]
+    pub fn new(buf: &'a [u8], endian: Endian) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            endian,
+            depth: 0,
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.pos + n > self.buf.len() {
+        let Some(end) = self.pos.checked_add(n) else {
+            return Err("unexpected end of message".to_string());
+        };
+        if end > self.buf.len() {
             return Err("unexpected end of message".to_string());
         }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
 
     fn u8(&mut self) -> Result<u8, String> {
         Ok(self.take(1)?[0])
     }
+
     fn i8(&mut self) -> Result<i8, String> {
         Ok(self.u8()? as i8)
     }
+
     fn i16(&mut self) -> Result<i16, String> {
         let b = self.take(2)?;
         let a = [b[0], b[1]];
-        Ok(if self.le {
-            i16::from_le_bytes(a)
-        } else {
-            i16::from_be_bytes(a)
+        Ok(match self.endian {
+            Endian::Little => i16::from_le_bytes(a),
+            Endian::Big => i16::from_be_bytes(a),
         })
     }
+
     fn i32(&mut self) -> Result<i32, String> {
         let b = self.take(4)?;
         let a = [b[0], b[1], b[2], b[3]];
-        Ok(if self.le {
-            i32::from_le_bytes(a)
-        } else {
-            i32::from_be_bytes(a)
+        Ok(match self.endian {
+            Endian::Little => i32::from_le_bytes(a),
+            Endian::Big => i32::from_be_bytes(a),
         })
     }
+
     fn i64(&mut self) -> Result<i64, String> {
         let b = self.take(8)?;
         let a = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-        Ok(if self.le {
-            i64::from_le_bytes(a)
-        } else {
-            i64::from_be_bytes(a)
+        Ok(match self.endian {
+            Endian::Little => i64::from_le_bytes(a),
+            Endian::Big => i64::from_be_bytes(a),
         })
     }
+
     fn f32(&mut self) -> Result<f32, String> {
         Ok(f32::from_bits(self.i32()? as u32))
     }
+
     fn f64(&mut self) -> Result<f64, String> {
         Ok(f64::from_bits(self.i64()? as u64))
     }
+
     fn guid(&mut self) -> Result<[u8; 16], String> {
         let b = self.take(16)?;
         let mut g = [0u8; 16];
         g.copy_from_slice(b);
         Ok(g)
     }
+
     fn sym(&mut self) -> Result<String, String> {
         let start = self.pos;
         while self.pos < self.buf.len() && self.buf[self.pos] != 0 {
@@ -146,7 +168,9 @@ impl<'a> Reader<'a> {
     fn vhdr(&mut self, elem_size: usize) -> Result<usize, String> {
         let attr = self.u8()?;
         if attr > 4 {
-            return Err(format!("invalid vector attribute byte 0x{:02x} (expected 0..=4)", attr));
+            return Err(format!(
+                "invalid vector attribute byte 0x{attr:02x} (expected 0..=4)"
+            ));
         }
         let n = self.i32()?;
         if n < 0 {
@@ -156,8 +180,7 @@ impl<'a> Reader<'a> {
         let remaining = self.buf.len().saturating_sub(self.pos);
         if count.saturating_mul(elem_size) > remaining {
             return Err(format!(
-                "vector length {} exceeds remaining payload ({} bytes)",
-                count, remaining
+                "vector length {count} exceeds remaining payload ({remaining} bytes)"
             ));
         }
         Ok(count)
@@ -167,8 +190,7 @@ impl<'a> Reader<'a> {
     pub fn read(&mut self) -> Result<K, String> {
         if self.depth >= MAX_READ_DEPTH {
             return Err(format!(
-                "max deserialization recursion depth exceeded ({})",
-                MAX_READ_DEPTH
+                "max deserialization recursion depth exceeded ({MAX_READ_DEPTH})"
             ));
         }
         self.depth += 1;
@@ -349,10 +371,24 @@ impl<'a> Reader<'a> {
             98 => {
                 let attr = self.u8()?;
                 if attr > 4 {
-                    return Err(format!("invalid table attribute byte 0x{:02x} (expected 0..=4)", attr));
+                    return Err(format!(
+                        "invalid table attribute byte 0x{attr:02x} (expected 0..=4)"
+                    ));
                 }
                 let dict = self.read()?;
-                Ok(K::Table(Box::new(dict)))
+                if let K::Dict(ref keys, ref vals) = dict {
+                    if let (K::SymbolV(names), K::List(cols)) = (&**keys, &**vals) {
+                        if names.len() != cols.len() {
+                            return Err(format!(
+                                "corrupt table: {} column names but {} column vectors",
+                                names.len(),
+                                cols.len()
+                            ));
+                        }
+                        return Ok(K::Table(Box::new(dict)));
+                    }
+                }
+                Err("corrupt table: expected dictionary of symbol names to column list".to_string())
             }
             99 => {
                 let keys = self.read()?;
@@ -360,9 +396,12 @@ impl<'a> Reader<'a> {
                 Ok(K::Dict(Box::new(keys), Box::new(vals)))
             }
             100 => {
-                // lambda: namespace symbol + char-vector body; surface the source
+                // lambda: namespace symbol + char-vector body; surface the source as Function
                 let _ns = self.sym()?;
-                self.read()
+                match self.read()? {
+                    K::CharV(s) => Ok(K::Function(s)),
+                    other => Ok(other),
+                }
             }
             101 => {
                 let op = self.u8()?;
@@ -414,19 +453,19 @@ impl<'a> Reader<'a> {
                     _ => "",
                 };
                 match inner {
-                    K::Function(s) => Ok(K::Function(format!("{}{}", s, adv))),
+                    K::Function(s) => Ok(K::Function(format!("{s}{adv}"))),
                     other => Ok(K::Projection(vec![other, K::Function(adv.to_string())])),
                 }
             }
             112 => {
                 let inner = self.read()?;
                 match inner {
-                    K::Function(s) => Ok(K::Function(format!("2: {}", s))),
+                    K::Function(s) => Ok(K::Function(format!("2: {s}"))),
                     other => Ok(K::Projection(vec![K::Function("2:".to_string()), other])),
                 }
             }
-            -128 => Err(format!("q error '{}", self.sym()?)),
-            _ => Err(format!("unsupported q type code {}", t)),
+            -128 => Err(format!("q error '{}'", self.sym()?)),
+            _ => Err(format!("unsupported q type code {t}")),
         }
     }
 }
@@ -436,19 +475,23 @@ fn unary_op_name(op: u8) -> String {
         1 => "flip".into(),
         2 => "neg".into(),
         3 => "first".into(),
-        4 => "where".into(),
-        5 => "reverse".into(),
-        6 => "asc".into(),
-        7 => "desc".into(),
-        8 => "group".into(),
-        9 => "not".into(),
-        10 => "distinct".into(),
-        11 => "enlist".into(),
-        12 => "null".into(),
-        13 => "count".into(),
-        14 => "floor".into(),
-        15 => "string".into(),
-        _ => format!("unary#{}", op),
+        4 => "reciprocal".into(),
+        5 => "where".into(),
+        6 => "reverse".into(),
+        7 => "iasc".into(),
+        8 => "idesc".into(),
+        9 => "group".into(),
+        10 => "not".into(),
+        11 => "key".into(),
+        12 => "enlist".into(),
+        13 => "null".into(),
+        14 => "count".into(),
+        15 => "floor".into(),
+        16 => "string".into(),
+        17 => "distinct".into(),
+        18 => "type".into(),
+        19 => "value".into(),
+        _ => format!("unary#{op}"),
     }
 }
 
@@ -467,7 +510,7 @@ fn binary_op_name(op: u8) -> String {
         10 => "<>".into(),
         11 => ">=".into(),
         12 => "<=".into(),
-        _ => format!("op#{}", op),
+        _ => format!("op#{op}"),
     }
 }
 
@@ -479,11 +522,12 @@ fn iter_name(op: u8) -> String {
         3 => "':".into(),
         4 => "/:".into(),
         5 => "\\:".into(),
-        _ => format!("iter#{}", op),
+        _ => format!("iter#{op}"),
     }
 }
 
 /// Length of a vector/list/table column-ish K (rows for tables).
+#[must_use]
 pub fn len_of(k: &K) -> usize {
     match k {
         K::BoolV(v) => v.len(),
@@ -517,6 +561,7 @@ pub fn len_of(k: &K) -> usize {
 
 /// Extract element `i` of a vector/list K as a scalar K (clones).
 /// Bounds-checked: returns K::Null if `i` is out of bounds, preventing panics on ragged tables.
+#[must_use]
 pub fn at(k: &K, i: usize) -> K {
     match k {
         K::BoolV(v) => v.get(i).copied().map(K::Bool).unwrap_or(K::Null),
@@ -529,7 +574,11 @@ pub fn at(k: &K, i: usize) -> K {
         K::FloatV(v) => v.get(i).copied().map(K::Float).unwrap_or(K::Null),
         K::CharV(v) => {
             if v.is_ascii() {
-                v.as_bytes().get(i).copied().map(|b| K::Char(b as char)).unwrap_or(K::Null)
+                v.as_bytes()
+                    .get(i)
+                    .copied()
+                    .map(|b| K::Char(b as char))
+                    .unwrap_or(K::Null)
             } else {
                 v.chars().nth(i).map(K::Char).unwrap_or(K::Null)
             }
@@ -544,7 +593,13 @@ pub fn at(k: &K, i: usize) -> K {
         K::SecondV(v) => v.get(i).copied().map(K::Second).unwrap_or(K::Null),
         K::TimeV(v) => v.get(i).copied().map(K::Time).unwrap_or(K::Null),
         K::List(v) => v.get(i).cloned().unwrap_or(K::Null),
-        other => if i == 0 { other.clone() } else { K::Null },
+        other => {
+            if i == 0 {
+                other.clone()
+            } else {
+                K::Null
+            }
+        }
     }
 }
 
@@ -556,7 +611,8 @@ const DAYS_2000_FROM_1970: i64 = 10957;
 
 /// (year, month, day) from days-since-2000.01.01 (Howard Hinnant's algorithm).
 fn civil(days_since_2000: i64) -> (i64, u32, u32) {
-    let z = days_since_2000 + DAYS_2000_FROM_1970 + 719468;
+    let clamped = days_since_2000.clamp(-100_000_000, 100_000_000);
+    let z = clamped + DAYS_2000_FROM_1970 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
@@ -568,6 +624,7 @@ fn civil(days_since_2000: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+#[must_use]
 pub fn fmt_date(d: i32) -> String {
     if d == NULL_INT {
         return String::new();
@@ -579,9 +636,10 @@ pub fn fmt_date(d: i32) -> String {
         return "-0Wd".into();
     }
     let (y, m, dd) = civil(d as i64);
-    format!("{:04}.{:02}.{:02}", y, m, dd)
+    format!("{y:04}.{m:02}.{dd:02}")
 }
 
+#[must_use]
 pub fn fmt_month(m: i32) -> String {
     if m == NULL_INT {
         return String::new();
@@ -594,7 +652,7 @@ pub fn fmt_month(m: i32) -> String {
     }
     let y = 2000 + m.div_euclid(12);
     let mon = m.rem_euclid(12) + 1;
-    format!("{:04}.{:02}", y, mon)
+    format!("{y:04}.{mon:02}")
 }
 
 fn hms_nanos(mut nanos: i64) -> (i64, u32, u32, u32, u32) {
@@ -609,6 +667,7 @@ fn hms_nanos(mut nanos: i64) -> (i64, u32, u32, u32, u32) {
     (days, h, mi, s, ns)
 }
 
+#[must_use]
 pub fn fmt_timestamp(v: i64) -> String {
     if v == NULL_LONG {
         return String::new();
@@ -621,12 +680,10 @@ pub fn fmt_timestamp(v: i64) -> String {
     }
     let (days, h, mi, s, ns) = hms_nanos(v);
     let (y, m, d) = civil(days);
-    format!(
-        "{:04}.{:02}.{:02}D{:02}:{:02}:{:02}.{:09}",
-        y, m, d, h, mi, s, ns
-    )
+    format!("{y:04}.{m:02}.{d:02}D{h:02}:{mi:02}:{s:02}.{ns:09}")
 }
 
+#[must_use]
 pub fn fmt_timespan(v: i64) -> String {
     if v == NULL_LONG {
         return String::new();
@@ -637,40 +694,31 @@ pub fn fmt_timespan(v: i64) -> String {
     if v == -i64::MAX {
         return "-0Wn".into();
     }
-    let neg = v < 0;
-    let (days, h, mi, s, ns) = hms_nanos(v.abs());
-    format!(
-        "{}{}D{:02}:{:02}:{:02}.{:09}",
-        if neg { "-" } else { "" },
-        days,
-        h,
-        mi,
-        s,
-        ns
-    )
+    let sign = if v < 0 { "-" } else { "" };
+    let (days, h, mi, s, ns) = hms_nanos(v.saturating_abs());
+    format!("{sign}{days}D{h:02}:{mi:02}:{s:02}.{ns:09}")
 }
 
+#[must_use]
 pub fn fmt_datetime(v: f64) -> String {
     if v.is_nan() {
         return String::new();
     }
-    if v.is_infinite() {
+    if v.is_infinite() || !(-100_000_000.0..=100_000_000.0).contains(&v) {
         return (if v.is_sign_positive() { "0Wz" } else { "-0Wz" }).into();
     }
-    let days = v.floor() as i64;
-    let frac = (v - v.floor()).abs();
+    let total_ms = (v * 86_400_000.0).round() as i64;
+    let days = total_ms.div_euclid(86_400_000);
+    let ms = total_ms.rem_euclid(86_400_000) as u64;
     let (y, m, d) = civil(days);
-    let ms = ((frac * 86_400_000.0).round() as u64).min(86_399_999);
     let h = ms / 3_600_000;
     let mi = (ms % 3_600_000) / 60_000;
     let s = (ms % 60_000) / 1000;
     let rem_ms = ms % 1000;
-    format!(
-        "{:04}.{:02}.{:02}T{:02}:{:02}:{:02}.{:03}",
-        y, m, d, h, mi, s, rem_ms
-    )
+    format!("{y:04}.{m:02}.{d:02}T{h:02}:{mi:02}:{s:02}.{rem_ms:03}")
 }
 
+#[must_use]
 pub fn fmt_time(ms: i32) -> String {
     if ms == NULL_INT {
         return String::new();
@@ -681,18 +729,16 @@ pub fn fmt_time(ms: i32) -> String {
     if ms == -i32::MAX {
         return "-0Wt".into();
     }
-    let neg = ms < 0;
-    let v = ms.abs();
-    format!(
-        "{}{:02}:{:02}:{:02}.{:03}",
-        if neg { "-" } else { "" },
-        v / 3_600_000,
-        (v / 60_000) % 60,
-        (v / 1000) % 60,
-        v % 1000
-    )
+    let sign = if ms < 0 { "-" } else { "" };
+    let v = ms.unsigned_abs();
+    let h = v / 3_600_000;
+    let mi = (v / 60_000) % 60;
+    let s = (v / 1000) % 60;
+    let rem = v % 1000;
+    format!("{sign}{h:02}:{mi:02}:{s:02}.{rem:03}")
 }
 
+#[must_use]
 pub fn fmt_minute(m: i32) -> String {
     if m == NULL_INT {
         return String::new();
@@ -703,11 +749,14 @@ pub fn fmt_minute(m: i32) -> String {
     if m == -i32::MAX {
         return "-0Wu".into();
     }
-    let neg = m < 0;
-    let v = m.abs();
-    format!("{}{:02}:{:02}", if neg { "-" } else { "" }, v / 60, v % 60)
+    let sign = if m < 0 { "-" } else { "" };
+    let v = m.unsigned_abs();
+    let h = v / 60;
+    let mi = v % 60;
+    format!("{sign}{h:02}:{mi:02}")
 }
 
+#[must_use]
 pub fn fmt_second(s: i32) -> String {
     if s == NULL_INT {
         return String::new();
@@ -718,26 +767,38 @@ pub fn fmt_second(s: i32) -> String {
     if s == -i32::MAX {
         return "-0Wv".into();
     }
-    let neg = s < 0;
-    let v = s.abs();
-    format!(
-        "{}{:02}:{:02}:{:02}",
-        if neg { "-" } else { "" },
-        v / 3600,
-        (v / 60) % 60,
-        v % 60
-    )
+    let sign = if s < 0 { "-" } else { "" };
+    let v = s.unsigned_abs();
+    let h = v / 3600;
+    let mi = (v / 60) % 60;
+    let sec = v % 60;
+    format!("{sign}{h:02}:{mi:02}:{sec:02}")
 }
 
+#[must_use]
 pub fn fmt_guid(g: &[u8; 16]) -> String {
-    let h: String = g.iter().map(|b| format!("{:02x}", b)).collect();
     format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
+        concat!(
+            "{:02x}{:02x}{:02x}{:02x}-",
+            "{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-",
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}"
+        ),
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
+        g[5],
+        g[6],
+        g[7],
+        g[8],
+        g[9],
+        g[10],
+        g[11],
+        g[12],
+        g[13],
+        g[14],
+        g[15]
     )
 }
 
@@ -746,81 +807,81 @@ pub fn fmt_guid(g: &[u8; 16]) -> String {
 // Only exercised for non-loopback responses > 2000 bytes.
 // ----------------------------------------------------------------------------
 
-pub fn decompress(src: &[u8], le: bool) -> Result<Vec<u8>, String> {
+pub fn decompress(src: &[u8], endian: Endian) -> Result<Vec<u8>, String> {
     // first 4 bytes of a compressed payload = uncompressed size (incl. 8B header)
     if src.len() < 4 {
         return Err("compressed payload too short".to_string());
     }
-    let usize_total = if le {
-        u32::from_le_bytes([src[0], src[1], src[2], src[3]])
-    } else {
-        u32::from_be_bytes([src[0], src[1], src[2], src[3]])
+    let size_bytes = [src[0], src[1], src[2], src[3]];
+    let usize_total = match endian {
+        Endian::Little => u32::from_le_bytes(size_bytes),
+        Endian::Big => u32::from_be_bytes(size_bytes),
     } as usize;
     if usize_total < 8 {
         return Err("bad uncompressed size".to_string());
     }
     const MAX_UNCOMPRESSED_SIZE: usize = 1024 * 1024 * 1024; // 1GB limit
     if usize_total > MAX_UNCOMPRESSED_SIZE {
-        return Err(format!("uncompressed size {} exceeds 1GB limit", usize_total));
+        return Err(format!("uncompressed size {usize_total} exceeds 1GB limit"));
     }
     let mut dst = vec![0u8; usize_total - 8];
-    let mut aa = [0usize; 256];
-    let mut s = 0usize; // write index into dst
-    let mut p = 0usize;
-    let mut d = 4usize; // read index into src (after the size word)
-    let mut i: u32 = 0;
-    let mut f: u32 = 0;
+    let mut hash_table = [0usize; 256];
+    let mut dst_pos = 0usize; // write index into dst
+    let mut hash_pos = 0usize;
+    let mut src_pos = 4usize; // read index into src (after the size word)
+    let mut bit_mask: u32 = 0;
+    let mut ctrl_byte: u32 = 0;
     // Every src/dst index below is bounds-checked: a corrupt or malicious
     // response must surface as Err (-> exit 4), never an out-of-bounds panic
     // (which, with panic=abort, would kill the process and lose the exit code).
-    while s < dst.len() {
-        if i == 0 {
-            if d >= src.len() {
+    while dst_pos < dst.len() {
+        if bit_mask == 0 {
+            if src_pos >= src.len() {
                 return Err("decompress overrun".to_string());
             }
-            f = src[d] as u32;
-            d += 1;
-            i = 1;
+            ctrl_byte = src[src_pos] as u32;
+            src_pos += 1;
+            bit_mask = 1;
         }
-        if (f & i) != 0 {
-            // back-reference: src[d] selects the copy source, src[d+1] the extra
+        if (ctrl_byte & bit_mask) != 0 {
+            // back-reference: src[src_pos] selects the copy source, src[src_pos+1] the extra
             // length; the run copies 2 + that many bytes from earlier in dst.
-            if d + 1 >= src.len() {
+            if src_pos + 1 >= src.len() {
                 return Err("decompress overrun (back-reference)".to_string());
             }
-            let mut r = aa[src[d] as usize]; // copy source: a pointer back into dst
-            if r >= s {
+            let mut ref_pos = hash_table[src[src_pos] as usize];
+            if ref_pos >= dst_pos {
                 return Err("decompress invalid back-reference before written offset".to_string());
             }
-            let mut remaining = src[d + 1] as usize + 2; // 2 + extra length
-            d += 2;
+            let mut remaining = src[src_pos + 1] as usize + 2; // 2 + extra length
+            src_pos += 2;
             while remaining > 0 {
-                if s >= dst.len() || r >= dst.len() {
+                if dst_pos >= dst.len() || ref_pos >= dst.len() {
                     return Err("decompress output overrun".to_string());
                 }
-                dst[s] = dst[r]; // byte-by-byte so overlapping (LZ) runs work
-                s += 1;
-                r += 1;
+                dst[dst_pos] = dst[ref_pos]; // byte-by-byte so overlapping (LZ) runs work
+                dst_pos += 1;
+                ref_pos += 1;
                 remaining -= 1;
             }
         } else {
-            if d >= src.len() {
+            if src_pos >= src.len() {
                 return Err("decompress overrun (literal)".to_string());
             }
-            dst[s] = src[d];
-            s += 1;
-            d += 1;
+            dst[dst_pos] = src[src_pos];
+            dst_pos += 1;
+            src_pos += 1;
         }
-        while p < s.saturating_sub(1) {
-            aa[(dst[p] as usize) ^ (dst[p + 1] as usize)] = p;
-            p += 1;
+        while hash_pos < dst_pos.saturating_sub(1) {
+            hash_table[(dst[hash_pos] as usize) ^ (dst[hash_pos + 1] as usize)] = hash_pos;
+            hash_pos += 1;
         }
-        if (f & i) != 0 {
-            p = s;
+        if (ctrl_byte & bit_mask) != 0 {
+            hash_pos = dst_pos;
         }
-        i <<= 1;
-        if i == 256 {
-            i = 0;
+        bit_mask <<= 1;
+        if bit_mask == 256 {
+            bit_mask = 0;
         }
     }
     Ok(dst)
@@ -866,7 +927,7 @@ mod tests {
     fn decompress_literal_only_roundtrip() {
         // [usize_total=11 (=8 header + 3 data)][control 0x00][1,2,3]
         let src = [11u8, 0, 0, 0, 0x00, 1, 2, 3];
-        assert_eq!(decompress(&src, true).unwrap(), vec![1u8, 2, 3]);
+        assert_eq!(decompress(&src, Endian::Little).unwrap(), vec![1u8, 2, 3]);
     }
 
     // A truncated back-reference must return Err, never panic (panic=abort would
@@ -874,41 +935,74 @@ mod tests {
     #[test]
     fn decompress_malformed_is_err_not_panic() {
         let src = [100u8, 0, 0, 0, 0x01, 5]; // control bit set but no ref bytes
-        assert!(decompress(&src, true).is_err());
-        assert!(decompress(&[1u8], true).is_err()); // too short for the size word
+        assert!(decompress(&src, Endian::Little).is_err());
+        assert!(decompress(&[1u8], Endian::Little).is_err()); // too short for the size word
     }
 
     #[test]
     fn decompress_invalid_backreference_before_written_offset_is_err() {
-        // [usize_total=12 (=8 header + 4 data)][control 0x01 (back-ref first)][src[d]=0, src[d+1]=0]
-        // At start s=0, aa[0]=0, so r=0 >= s(0), which must be rejected.
+        // [usize_total=12 (=8 header + 4 data)][control 0x01][src[d]=0, src[d+1]=0]
+        // At start dst_pos=0, hash_table[0]=0, so ref_pos=0 >= dst_pos(0), rejected.
         let src = [12u8, 0, 0, 0, 0x01, 0, 0];
-        let res = decompress(&src, true);
+        let res = decompress(&src, Endian::Little);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("invalid back-reference"));
+    }
+
+    #[test]
+    fn decompress_backreference_roundtrip() {
+        // 2 literals [10, 20] -> hash_table[10 ^ 20 = 30] = 0.
+        // Then 1 back-ref (bit 2 -> ctrl = 0x04) from hash 30 with extra_len=2 (total 4 bytes).
+        // Output should be [10, 20, 10, 20, 10, 20] (6 bytes -> usize_total = 14).
+        let src = [14u8, 0, 0, 0, 0x04, 10, 20, 30, 2];
+        assert_eq!(
+            decompress(&src, Endian::Little).unwrap(),
+            vec![10u8, 20, 10, 20, 10, 20]
+        );
+    }
+
+    #[test]
+    fn big_endian_and_compound_deserialization() {
+        // Big-endian Int atom (-6 = 250u8) with value 42
+        let mut buf = vec![250u8];
+        buf.extend_from_slice(&42i32.to_be_bytes());
+        assert_eq!(Reader::new(&buf, Endian::Big).read().unwrap(), K::Int(42));
+
+        // q error response (-128 = 128u8) with symbol "type\0"
+        let err_buf = [128u8, b't', b'y', b'p', b'e', 0];
+        let err = Reader::new(&err_buf, Endian::Little).read().unwrap_err();
+        assert_eq!(err, "q error 'type'");
+    }
+
+    #[test]
+    fn datetime_rounding_and_extreme_bounds() {
+        // 0.9999999999 days rounds up to 1.0 day -> 2000.01.02T00:00:00.000
+        assert_eq!(fmt_datetime(0.9999999999), "2000.01.02T00:00:00.000");
+        assert_eq!(fmt_datetime(1e30), "0Wz");
+        assert_eq!(fmt_datetime(-1e30), "-0Wz");
     }
 
     #[test]
     fn decompress_over_1gb_is_err() {
         // Size word claiming 2GB
         let src = [0x00, 0x00, 0x00, 0x80, 0x00, 1, 2, 3];
-        assert!(decompress(&src, true).is_err());
+        assert!(decompress(&src, Endian::Little).is_err());
     }
 
     #[test]
     fn sym_unterminated_returns_err() {
         // -11 (symbol atom), followed by "abc" with NO null terminator
         let buf = [245u8, b'a', b'b', b'c'];
-        assert!(Reader::new(&buf, true).read().is_err());
+        assert!(Reader::new(&buf, Endian::Little).read().is_err());
     }
 
     #[test]
     fn vhdr_exceeding_buffer_returns_err_not_oom() {
-        // Type 1 (bool vector): type=1, attr=0, count=0x7fffffff (2 billion) but payload has only 4 bytes
+        // Type 1 (bool vector): count=i32::MAX but payload has only 4 bytes
         let mut buf = vec![1u8, 0u8];
         buf.extend_from_slice(&i32::MAX.to_le_bytes());
         buf.extend_from_slice(&[1, 0, 1, 0]);
-        assert!(Reader::new(&buf, true).read().is_err());
+        assert!(Reader::new(&buf, Endian::Little).read().is_err());
     }
 
     #[test]
@@ -917,9 +1011,11 @@ mod tests {
         let mut buf = vec![1u8, 99u8];
         buf.extend_from_slice(&1i32.to_le_bytes());
         buf.push(1u8);
-        let err = Reader::new(&buf, true).read();
+        let err = Reader::new(&buf, Endian::Little).read();
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("invalid vector attribute byte 0x63"));
+        assert!(err
+            .unwrap_err()
+            .contains("invalid vector attribute byte 0x63"));
     }
 
     #[test]
@@ -933,9 +1029,11 @@ mod tests {
         }
         buf.push(245u8); // -11 (symbol)
         buf.push(0u8); // empty symbol `
-        let err = Reader::new(&buf, true).read();
+        let err = Reader::new(&buf, Endian::Little).read();
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("max deserialization recursion depth exceeded"));
+        assert!(err
+            .unwrap_err()
+            .contains("max deserialization recursion depth exceeded"));
     }
 
     #[test]
@@ -978,5 +1076,25 @@ mod tests {
         assert_eq!(fmt_datetime(f64::NEG_INFINITY), "-0Wz");
         assert_eq!(fmt_minute(i32::MAX), "0Wu");
         assert_eq!(fmt_second(i32::MAX), "0Wv");
+    }
+
+    #[test]
+    fn unary_op_names_and_lambda_deserialization() {
+        assert_eq!(unary_op_name(1), "flip");
+        assert_eq!(unary_op_name(4), "reciprocal");
+        assert_eq!(unary_op_name(5), "where");
+        assert_eq!(unary_op_name(11), "key");
+        assert_eq!(unary_op_name(14), "count");
+        assert_eq!(unary_op_name(16), "string");
+        assert_eq!(unary_op_name(19), "value");
+
+        // Type 100 (lambda): empty ns symbol `\0` + type 10 char vector "{x+1}"
+        let mut buf = vec![100u8, 0u8, 10u8, 0u8];
+        buf.extend_from_slice(&5i32.to_le_bytes());
+        buf.extend_from_slice(b"{x+1}");
+        assert_eq!(
+            Reader::new(&buf, Endian::Little).read().unwrap(),
+            K::Function("{x+1}".into())
+        );
     }
 }

@@ -1,9 +1,13 @@
 //! Render a deserialized `K` value as readable text or as JSON.
 //! Row caps take a `max` argument; `max == 0` means unlimited.
 
+use std::fmt::Write as _;
+
 use unicode_width::UnicodeWidthStr;
 
-use crate::k::*;
+use crate::k;
+use crate::k::{K, NULL_INT, NULL_LONG, NULL_SHORT};
+use crate::query;
 
 // ============================================================================
 // Shared scalar formatting
@@ -17,17 +21,22 @@ fn fmt_float(v: f64) -> String {
     if v.is_nan() {
         "0n".into()
     } else if v.is_infinite() {
-        if v > 0.0 { "0w".into() } else { "-0w".into() }
+        if v > 0.0 {
+            "0w".into()
+        } else {
+            "-0w".into()
+        }
     } else {
-        format!("{}", v)
+        format!("{v}")
     }
 }
 
 /// Plain string for a single scalar (also used for table cells in text mode).
-pub fn scalar_to_string(k: &K) -> String {
-    match k {
+#[must_use]
+pub fn scalar_to_string(val: &K) -> String {
+    match val {
         K::Bool(b) => (if *b { "1" } else { "0" }).into(),
-        K::Byte(x) => format!("0x{:02x}", x),
+        K::Byte(x) => format!("0x{x:02x}"),
         K::Short(v) => {
             if *v == NULL_SHORT {
                 "0N".into()
@@ -64,16 +73,70 @@ pub fn scalar_to_string(k: &K) -> String {
         K::Real(v) => fmt_float(*v as f64),
         K::Float(v) => fmt_float(*v),
         K::Char(c) => c.to_string(),
-        K::Symbol(s) => if s.is_empty() { "`".into() } else { s.clone() },
-        K::Timestamp(v) => fmt_timestamp(*v),
-        K::Month(v) => fmt_month(*v),
-        K::Date(v) => fmt_date(*v),
-        K::Datetime(v) => fmt_datetime(*v),
-        K::Timespan(v) => fmt_timespan(*v),
-        K::Minute(v) => fmt_minute(*v),
-        K::Second(v) => fmt_second(*v),
-        K::Time(v) => fmt_time(*v),
-        K::Guid(g) => fmt_guid(g),
+        K::Symbol(s) => {
+            if s.is_empty() {
+                "`".into()
+            } else {
+                s.clone()
+            }
+        }
+        K::Timestamp(v) => {
+            if *v == NULL_LONG {
+                "0Np".into()
+            } else {
+                k::fmt_timestamp(*v)
+            }
+        }
+        K::Month(v) => {
+            if *v == NULL_INT {
+                "0Nm".into()
+            } else {
+                k::fmt_month(*v)
+            }
+        }
+        K::Date(v) => {
+            if *v == NULL_INT {
+                "0Nd".into()
+            } else {
+                k::fmt_date(*v)
+            }
+        }
+        K::Datetime(v) => {
+            if v.is_nan() {
+                "0Nz".into()
+            } else {
+                k::fmt_datetime(*v)
+            }
+        }
+        K::Timespan(v) => {
+            if *v == NULL_LONG {
+                "0Nn".into()
+            } else {
+                k::fmt_timespan(*v)
+            }
+        }
+        K::Minute(v) => {
+            if *v == NULL_INT {
+                "0Nu".into()
+            } else {
+                k::fmt_minute(*v)
+            }
+        }
+        K::Second(v) => {
+            if *v == NULL_INT {
+                "0Nv".into()
+            } else {
+                k::fmt_second(*v)
+            }
+        }
+        K::Time(v) => {
+            if *v == NULL_INT {
+                "0Nt".into()
+            } else {
+                k::fmt_time(*v)
+            }
+        }
+        K::Guid(g) => k::fmt_guid(g),
         K::Null => "::".into(),
         K::Function(s) => s.clone(),
         K::Projection(v) => {
@@ -81,64 +144,62 @@ pub fn scalar_to_string(k: &K) -> String {
                 "{}".to_string()
             } else {
                 let f = scalar_to_string(&v[0]);
-                let args = v[1..]
+                let arg_parts: Vec<String> = v[1..]
                     .iter()
                     .map(|arg| match arg {
                         K::Null => String::new(),
                         other => scalar_to_string(other),
                     })
-                    .collect::<Vec<_>>()
-                    .join(";");
-                format!("{}[{}]", f, args)
+                    .collect();
+                let args = arg_parts.join(";");
+                format!("{f}[{args}]")
             }
         }
         // nested table/dict in a scalar slot -> compact summary (no recursion)
-        K::Table(_) => format!("(table: {} rows)", table_rows(k).unwrap_or(0)),
+        K::Table(_) => format!("(table: {} rows)", table_rows(val).unwrap_or(0)),
         K::Dict(_, _) => "(dict)".into(),
         other => compact_vec(other, 0),
     }
 }
 
 /// Cell string for CSV (nulls format as empty strings per CSV standard).
-fn scalar_to_csv(k: &K) -> String {
-    match k {
+fn scalar_to_csv(val: &K) -> String {
+    match val {
         K::Short(v) if *v == NULL_SHORT => String::new(),
-        K::Int(v) if *v == NULL_INT => String::new(),
-        K::Long(v) if *v == NULL_LONG => String::new(),
+        K::Int(v) | K::Month(v) | K::Date(v) | K::Minute(v) | K::Second(v) | K::Time(v)
+            if *v == NULL_INT =>
+        {
+            String::new()
+        }
+        K::Long(v) | K::Timestamp(v) | K::Timespan(v) if *v == NULL_LONG => String::new(),
         K::Real(v) if v.is_nan() => String::new(),
-        K::Float(v) if v.is_nan() => String::new(),
-        K::Symbol(s) => s.clone(),
+        K::Float(v) | K::Datetime(v) if v.is_nan() => String::new(),
+        K::Symbol(s) | K::CharV(s) => s.clone(),
         K::Null => String::new(),
-        _ => scalar_to_string(k),
+        _ => scalar_to_string(val),
     }
 }
 
-fn scalar_sym_aware(k: &K) -> String {
-    match k {
-        K::Symbol(s) => format!("`{}", s),
-        _ => scalar_to_string(k),
+fn scalar_sym_aware(val: &K) -> String {
+    match val {
+        K::Symbol(s) => format!("`{s}"),
+        _ => scalar_to_string(val),
     }
 }
 
 /// Compact one-line form for a vector (used inside lists / nested cells / vector rendering).
-fn compact_vec(k: &K, max: usize) -> String {
-    match k {
+fn compact_vec(val: &K, max: usize) -> String {
+    match val {
         K::CharV(s) => {
-            let escaped = s
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            format!("\"{}\"", escaped)
+            let escaped = query::q_escape(s);
+            format!("\"{escaped}\"")
         }
         K::ByteV(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
             let mut s = String::from("0x");
             for b in &v[..shown] {
-                use std::fmt::Write;
-                write!(s, "{:02x}", b).ok();
+                write!(s, "{b:02x}").ok();
             }
             if shown < n {
                 s.push_str("...");
@@ -164,7 +225,7 @@ fn compact_vec(k: &K, max: usize) -> String {
         K::SymbolV(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
-            let mut s = v[..shown].iter().map(|s| format!("`{}", s)).collect::<String>();
+            let mut s: String = v[..shown].iter().map(|sym| format!("`{sym}")).collect();
             if shown < n {
                 s.push_str("...");
             }
@@ -173,19 +234,20 @@ fn compact_vec(k: &K, max: usize) -> String {
         K::List(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
-            let mut inner = v[..shown].iter().map(scalar_sym_aware).collect::<Vec<_>>().join(";");
+            let parts: Vec<String> = v[..shown].iter().map(scalar_sym_aware).collect();
+            let mut inner = parts.join(";");
             if shown < n {
                 inner.push_str(";...");
             }
-            format!("({})", inner)
+            format!("({inner})")
         }
         _ => {
-            let n = len_of(k);
+            let n = k::len_of(val);
             let shown = if max == 0 { n } else { n.min(max) };
-            let mut items = (0..shown)
-                .map(|i| scalar_to_string(&at(k, i)))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let parts: Vec<String> = (0..shown)
+                .map(|i| scalar_to_string(&k::at(val, i)))
+                .collect();
+            let mut items = parts.join(" ");
             if shown < n {
                 items.push_str(" ...");
             }
@@ -198,23 +260,31 @@ fn compact_vec(k: &K, max: usize) -> String {
 // Table extraction
 // ============================================================================
 
-fn is_table(k: &K) -> bool {
-    matches!(k, K::Table(_))
+fn is_table(val: &K) -> bool {
+    matches!(val, K::Table(_))
 }
 
-fn dict_parts(d: &K) -> Option<(Vec<String>, Vec<K>)> {
+fn dict_parts(d: &K) -> Option<(&[String], &[K])> {
     if let K::Dict(keys, vals) = d {
         if let (K::SymbolV(names), K::List(cols)) = (&**keys, &**vals) {
-            return Some((names.clone(), cols.clone()));
+            if names.len() == cols.len() {
+                return Some((names.as_slice(), cols.as_slice()));
+            }
         }
     }
     None
 }
 
-/// (column names, columns) for a table or keyed table.
-fn table_parts(k: &K) -> Option<(Vec<String>, Vec<K>)> {
-    match k {
-        K::Table(d) => dict_parts(d),
+/// (column names, columns) for a table or keyed table, borrowing elements without cloning columns.
+fn table_parts(val: &K) -> Option<(Vec<&str>, Vec<&K>)> {
+    match val {
+        K::Table(d) => {
+            let (names, cols) = dict_parts(d)?;
+            Some((
+                names.iter().map(String::as_str).collect(),
+                cols.iter().collect(),
+            ))
+        }
         K::Dict(kk, vv) if is_table(kk) && is_table(vv) => {
             let (mut names, mut cols) = table_parts(kk)?;
             let (vn, vc) = table_parts(vv)?;
@@ -226,24 +296,34 @@ fn table_parts(k: &K) -> Option<(Vec<String>, Vec<K>)> {
     }
 }
 
-/// Row count if `k` is a table or keyed table (used for truncation signalling).
-pub fn table_rows(k: &K) -> Option<usize> {
-    table_parts(k).map(|(_, cols)| cols.first().map(len_of).unwrap_or(0))
+/// Row count if `val` is a table or keyed table (used for truncation signalling).
+#[must_use]
+pub fn table_rows(val: &K) -> Option<usize> {
+    match val {
+        K::Table(d) => dict_parts(d).map(|(_, cols)| cols.first().map_or(0, k::len_of)),
+        K::Dict(kk, vv) if is_table(kk) && is_table(vv) => table_rows(kk),
+        _ => None,
+    }
 }
 
 fn cap(nrows: usize, max: usize) -> usize {
-    if max == 0 { nrows } else { nrows.min(max) }
+    if max == 0 {
+        nrows
+    } else {
+        nrows.min(max)
+    }
 }
 
 // ============================================================================
 // Text rendering
 // ============================================================================
 
-pub fn to_text(k: &K, max: usize) -> String {
-    if let Some((names, cols)) = table_parts(k) {
+#[must_use]
+pub fn to_text(val: &K, max: usize) -> String {
+    if let Some((names, cols)) = table_parts(val) {
         return render_table(&names, &cols, max);
     }
-    match k {
+    match val {
         K::Dict(keys, vals) => render_dict(keys, vals, max),
         K::CharV(s) => s.clone(),
         K::List(v) => {
@@ -253,21 +333,22 @@ pub fn to_text(k: &K, max: usize) -> String {
             for item in &v[..shown] {
                 if table_parts(item).is_some() || matches!(item, K::Dict(_, _)) {
                     for l in to_text(item, max).lines() {
-                        parts.push(format!("  {}", l));
+                        parts.push(format!("  {l}"));
                     }
                 } else {
                     parts.push(scalar_sym_aware(item));
                 }
             }
             if shown < n {
-                parts.push(format!("  ... ({} more items)", n - shown));
+                let remaining = n - shown;
+                parts.push(format!("  ... ({remaining} more items)"));
             }
             parts.join("\n")
         }
         K::Null => "::".into(),
-        K::Symbol(s) => format!("`{}", s),
+        K::Symbol(s) => format!("`{s}"),
         atom_or_vec => {
-            if len_of(atom_or_vec) > 1 {
+            if k::len_of(atom_or_vec) > 1 {
                 compact_vec(atom_or_vec, max)
             } else {
                 scalar_to_string(atom_or_vec)
@@ -276,16 +357,16 @@ pub fn to_text(k: &K, max: usize) -> String {
     }
 }
 
-fn render_table(names: &[String], cols: &[K], max: usize) -> String {
-    let nrows = cols.first().map(len_of).unwrap_or(0);
+fn render_table(names: &[&str], cols: &[&K], max: usize) -> String {
+    let nrows = cols.first().copied().map_or(0, k::len_of);
     let shown = cap(nrows, max);
 
     let mut widths: Vec<usize> = names.iter().map(|n| str_width(n)).collect();
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(cols.len());
-    for (ci, col) in cols.iter().enumerate() {
+    for (ci, &col) in cols.iter().enumerate() {
         let mut colcells = Vec::with_capacity(shown);
         for i in 0..shown {
-            let s = scalar_to_string(&at(col, i));
+            let s = scalar_to_string(&k::at(col, i));
             widths[ci] = widths[ci].max(str_width(&s));
             colcells.push(s);
         }
@@ -300,20 +381,22 @@ fn render_table(names: &[String], cols: &[K], max: usize) -> String {
         out.push_str(&pad(name, widths[ci]));
     }
     out.push('\n');
-    let total: usize = widths.iter().sum::<usize>() + names.len().saturating_sub(1);
+    let width_sum: usize = widths.iter().sum();
+    let total = width_sum + names.len().saturating_sub(1);
     out.push_str(&"-".repeat(total));
     out.push('\n');
     for i in 0..shown {
-        for ci in 0..cols.len() {
+        for (ci, (col_cells, &w)) in cells.iter().zip(&widths).enumerate() {
             if ci > 0 {
                 out.push(' ');
             }
-            out.push_str(&pad(&cells[ci][i], widths[ci]));
+            out.push_str(&pad(&col_cells[i], w));
         }
         out.push('\n');
     }
     if nrows > shown {
-        out.push_str(&format!("..({} more of {} rows)\n", nrows - shown, nrows));
+        let more = nrows - shown;
+        let _ = writeln!(out, "..({more} more of {nrows} rows)");
     }
     out.trim_end().to_string()
 }
@@ -323,30 +406,38 @@ fn pad(s: &str, w: usize) -> String {
     if sw >= w {
         s.to_string()
     } else {
-        format!("{}{}", s, " ".repeat(w - sw))
+        let spaces = " ".repeat(w - sw);
+        format!("{s}{spaces}")
     }
 }
 
-/// Dict as `key| value` lines; a table-valued or dict-valued entry is rendered as an indented
-/// sub-block (so e.g. `describe`'s columns/sample and nested dicts show in full).
+/// Dict as `key| value` lines; a table-valued or dict-valued entry is rendered
+/// as an indented sub-block (so e.g. `describe`'s columns/sample and nested dicts show in full).
 fn render_dict(keys: &K, vals: &K, max: usize) -> String {
-    let n = len_of(keys);
-    let kw = (0..n)
-        .map(|i| str_width(&scalar_to_string(&at(keys, i))))
+    let n = k::len_of(keys);
+    let shown = cap(n, max);
+    let kw = (0..shown)
+        .map(|i| str_width(&scalar_to_string(&k::at(keys, i))))
         .max()
         .unwrap_or(0);
     let mut lines: Vec<String> = Vec::new();
-    for i in 0..n {
-        let kstr = scalar_to_string(&at(keys, i));
-        let v = at(vals, i);
+    for i in 0..shown {
+        let kstr = scalar_to_string(&k::at(keys, i));
+        let v = k::at(vals, i);
+        let padded_key = pad(&kstr, kw);
         if table_parts(&v).is_some() || matches!(v, K::Dict(_, _)) {
-            lines.push(format!("{}|", pad(&kstr, kw)));
+            lines.push(format!("{padded_key}|"));
             for l in to_text(&v, max).lines() {
-                lines.push(format!("  {}", l));
+                lines.push(format!("  {l}"));
             }
         } else {
-            lines.push(format!("{}| {}", pad(&kstr, kw), scalar_sym_aware(&v)));
+            let val_str = scalar_sym_aware(&v);
+            lines.push(format!("{padded_key}| {val_str}"));
         }
+    }
+    if n > shown {
+        let more = n - shown;
+        lines.push(format!("..({more} more of {n} entries)"));
     }
     lines.join("\n")
 }
@@ -355,25 +446,20 @@ fn render_dict(keys: &K, vals: &K, max: usize) -> String {
 // CSV rendering (tables only; non-tables fall back to text). Uncapped.
 // ============================================================================
 
-pub fn to_csv(k: &K) -> String {
-    let (names, cols) = match table_parts(k) {
-        Some(p) => p,
-        None => return to_text(k, 0),
+#[must_use]
+pub fn to_csv(val: &K) -> String {
+    let Some((names, cols)) = table_parts(val) else {
+        return to_text(val, 0);
     };
-    let nrows = cols.first().map(len_of).unwrap_or(0);
+    let nrows = cols.first().copied().map_or(0, k::len_of);
     let mut out = String::new();
-    out.push_str(
-        &names
-            .iter()
-            .map(|n| csv_field(n))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
+    let header_fields: Vec<String> = names.iter().map(|n| csv_field(n)).collect();
+    out.push_str(&header_fields.join(","));
     out.push('\n');
     for i in 0..nrows {
         let row: Vec<String> = cols
             .iter()
-            .map(|c| csv_field(&scalar_to_csv(&at(c, i))))
+            .map(|&c| csv_field(&scalar_to_csv(&k::at(c, i))))
             .collect();
         out.push_str(&row.join(","));
         out.push('\n');
@@ -383,7 +469,8 @@ pub fn to_csv(k: &K) -> String {
 
 fn csv_field(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
     } else {
         s.to_string()
     }
@@ -393,15 +480,16 @@ fn csv_field(s: &str) -> String {
 // JSON rendering
 // ============================================================================
 
-pub fn to_json(k: &K, max: usize) -> String {
-    if let Some((names, cols)) = table_parts(k) {
+#[must_use]
+pub fn to_json(val: &K, max: usize) -> String {
+    if let Some((names, cols)) = table_parts(val) {
         return json_rows(&names, &cols, max);
     }
-    json_frag(k, max)
+    json_frag(val, max)
 }
 
-fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
-    let nrows = cap(cols.first().map(len_of).unwrap_or(0), max);
+fn json_rows(names: &[&str], cols: &[&K], max: usize) -> String {
+    let nrows = cap(cols.first().copied().map_or(0, k::len_of), max);
     let mut out = String::from("[");
     for i in 0..nrows {
         if i > 0 {
@@ -414,7 +502,7 @@ fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
             }
             out.push_str(&json_string(name));
             out.push(':');
-            out.push_str(&json_frag(&at(&cols[ci], i), 0));
+            out.push_str(&json_frag(&k::at(cols[ci], i), 0));
         }
         out.push('}');
     }
@@ -422,8 +510,8 @@ fn json_rows(names: &[String], cols: &[K], max: usize) -> String {
     out
 }
 
-fn json_frag(k: &K, max: usize) -> String {
-    match k {
+fn json_frag(val: &K, max: usize) -> String {
+    match val {
         K::Bool(b) => (if *b { "true" } else { "false" }).into(),
         K::Byte(x) => x.to_string(),
         K::Short(v) => num_or_null(*v == NULL_SHORT, *v as i64),
@@ -433,31 +521,81 @@ fn json_frag(k: &K, max: usize) -> String {
         K::Float(v) => float_json(*v),
         K::Char(c) => json_string(&c.to_string()),
         K::Symbol(s) => json_string(s),
-        K::Timestamp(v) => json_string(&fmt_timestamp(*v)),
-        K::Month(v) => json_string(&fmt_month(*v)),
-        K::Date(v) => json_string(&fmt_date(*v)),
-        K::Datetime(v) => json_string(&fmt_datetime(*v)),
-        K::Timespan(v) => json_string(&fmt_timespan(*v)),
-        K::Minute(v) => json_string(&fmt_minute(*v)),
-        K::Second(v) => json_string(&fmt_second(*v)),
-        K::Time(v) => json_string(&fmt_time(*v)),
-        K::Guid(g) => json_string(&fmt_guid(g)),
+        K::Timestamp(v) => {
+            if *v == NULL_LONG {
+                "null".into()
+            } else {
+                json_string(&k::fmt_timestamp(*v))
+            }
+        }
+        K::Month(v) => {
+            if *v == NULL_INT {
+                "null".into()
+            } else {
+                json_string(&k::fmt_month(*v))
+            }
+        }
+        K::Date(v) => {
+            if *v == NULL_INT {
+                "null".into()
+            } else {
+                json_string(&k::fmt_date(*v))
+            }
+        }
+        K::Datetime(v) => {
+            if v.is_nan() {
+                "null".into()
+            } else {
+                json_string(&k::fmt_datetime(*v))
+            }
+        }
+        K::Timespan(v) => {
+            if *v == NULL_LONG {
+                "null".into()
+            } else {
+                json_string(&k::fmt_timespan(*v))
+            }
+        }
+        K::Minute(v) => {
+            if *v == NULL_INT {
+                "null".into()
+            } else {
+                json_string(&k::fmt_minute(*v))
+            }
+        }
+        K::Second(v) => {
+            if *v == NULL_INT {
+                "null".into()
+            } else {
+                json_string(&k::fmt_second(*v))
+            }
+        }
+        K::Time(v) => {
+            if *v == NULL_INT {
+                "null".into()
+            } else {
+                json_string(&k::fmt_time(*v))
+            }
+        }
+        K::Guid(g) => json_string(&k::fmt_guid(g)),
         K::CharV(s) => json_string(s),
         K::SymbolV(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
             let items: Vec<String> = v[..shown].iter().map(|s| json_string(s)).collect();
-            format!("[{}]", items.join(","))
+            let joined = items.join(",");
+            format!("[{joined}]")
         }
         K::List(v) => {
             let n = v.len();
             let shown = if max == 0 { n } else { n.min(max) };
             let items: Vec<String> = v[..shown].iter().map(|item| json_frag(item, max)).collect();
-            format!("[{}]", items.join(","))
+            let joined = items.join(",");
+            format!("[{joined}]")
         }
         K::Dict(keys, vals) => json_dict(keys, vals, max),
         K::Table(_) => {
-            if let Some((names, cols)) = table_parts(k) {
+            if let Some((names, cols)) = table_parts(val) {
                 json_rows(&names, &cols, max)
             } else {
                 "null".into()
@@ -465,12 +603,15 @@ fn json_frag(k: &K, max: usize) -> String {
         }
         K::Null => "null".into(),
         K::Function(s) => json_string(s),
-        K::Projection(_) => json_string(&scalar_to_string(k)),
+        K::Projection(_) => json_string(&scalar_to_string(val)),
         other => {
-            let n = len_of(other);
+            let n = k::len_of(other);
             let shown = if max == 0 { n } else { n.min(max) };
-            let items: Vec<String> = (0..shown).map(|i| json_frag(&at(other, i), max)).collect();
-            format!("[{}]", items.join(","))
+            let items: Vec<String> = (0..shown)
+                .map(|i| json_frag(&k::at(other, i), max))
+                .collect();
+            let joined = items.join(",");
+            format!("[{joined}]")
         }
     }
 }
@@ -480,29 +621,29 @@ fn json_dict(keys: &K, vals: &K, max: usize) -> String {
         let n = names.len();
         let shown = if max == 0 { n } else { n.min(max) };
         let mut out = String::from("{");
-        for i in 0..shown {
+        for (i, name) in names[..shown].iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&json_string(&names[i]));
+            out.push_str(&json_string(name));
             out.push(':');
-            out.push_str(&json_frag(&at(vals, i), max));
+            out.push_str(&json_frag(&k::at(vals, i), max));
         }
         out.push('}');
         out
     } else if is_table(keys) && is_table(vals) {
-        if let Some((names, cols)) =
-            table_parts(&K::Dict(Box::new(keys.clone()), Box::new(vals.clone())))
+        if let (Some((mut names, mut cols)), Some((vn, vc))) =
+            (table_parts(keys), table_parts(vals))
         {
+            names.extend(vn);
+            cols.extend(vc);
             return json_rows(&names, &cols, max);
         }
         "null".into()
     } else {
-        format!(
-            "{{\"keys\":{},\"values\":{}}}",
-            json_frag(keys, max),
-            json_frag(vals, max)
-        )
+        let keys_json = json_frag(keys, max);
+        let vals_json = json_frag(vals, max);
+        format!("{{\"keys\":{keys_json},\"values\":{vals_json}}}")
     }
 }
 
@@ -516,13 +657,14 @@ fn num_or_null(is_null: bool, v: i64) -> String {
 
 fn float_json(v: f64) -> String {
     if v.is_finite() {
-        format!("{}", v)
+        format!("{v}")
     } else {
         "null".into()
     }
 }
 
 /// JSON-escape a string (public so error output can reuse it).
+#[must_use]
 pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -533,7 +675,10 @@ pub fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                let code = c as u32;
+                out.push_str(&format!("\\u{code:04x}"));
+            }
             c => out.push(c),
         }
     }
@@ -622,13 +767,17 @@ mod tests {
         );
         let outer = K::Dict(
             Box::new(K::SymbolV(vec!["a".into(), "b".into()])),
-            Box::new(K::List(vec![inner, K::Int(3)])),
+            Box::new(K::List(vec![inner.clone(), K::Int(3)])),
         );
         let text = to_text(&outer, 0);
         assert!(text.contains("a|"));
         assert!(text.contains("  x| 1"));
         assert!(text.contains("  y| 2"));
         assert!(text.contains("b| 3"));
+
+        let capped = to_text(&inner, 1);
+        assert!(capped.contains("x| 1"));
+        assert!(capped.contains("..(1 more of 2 entries)"));
     }
 
     #[test]
@@ -693,7 +842,40 @@ mod tests {
         assert_eq!(compact_vec(&K::ByteV(vec![10, 20, 30]), 2), "0x0a14...");
         assert_eq!(compact_vec(&K::BoolV(vec![true, false, true]), 0), "101b");
         assert_eq!(compact_vec(&K::BoolV(vec![]), 0), "0#0b");
-        assert_eq!(compact_vec(&K::BoolV(vec![true, false, true, false]), 2), "10b...");
+        assert_eq!(
+            compact_vec(&K::BoolV(vec![true, false, true, false]), 2),
+            "10b..."
+        );
+    }
+
+    #[test]
+    fn csv_string_column_and_temporal_nulls() {
+        let table = K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["id".into(), "msg".into(), "d".into()])),
+            Box::new(K::List(vec![
+                K::IntV(vec![1, 2]),
+                K::List(vec![K::CharV("hello".into()), K::CharV("a,b".into())]),
+                K::DateV(vec![NULL_INT, 0]),
+            ])),
+        )));
+        assert_eq!(to_csv(&table), "id,msg,d\n1,hello,\n2,\"a,b\",2000.01.01");
+        assert_eq!(
+            to_json(&table, 0),
+            r#"[{"id":1,"msg":"hello","d":null},{"id":2,"msg":"a,b","d":"2000.01.01"}]"#
+        );
+        assert_eq!(
+            to_text(&K::DateV(vec![NULL_INT, 0]), 0),
+            "0Nd 2000.01.01"
+        );
+    }
+
+    #[test]
+    fn corrupt_table_mismatched_columns_does_not_panic() {
+        let bad_table = K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["a".into(), "b".into()])),
+            Box::new(K::List(vec![K::IntV(vec![1, 2])])),
+        )));
+        assert_eq!(to_json(&bad_table, 0), "null");
+        assert_eq!(to_text(&bad_table, 0), "(table: 0 rows)");
     }
 }
-

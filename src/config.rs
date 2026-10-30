@@ -18,9 +18,12 @@
 //!   - `@name` / `name`        -> looked up in the merged config
 //!   - `@` / `default` / empty -> the `default` entry
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::conn;
 
 const PROJECT_FILE: &str = ".q-cli.conf";
 
@@ -28,21 +31,33 @@ const PROJECT_FILE: &str = ".q-cli.conf";
 // Paths
 // ---------------------------------------------------------------------------
 
-/// The global config path (`$Q_CLI_CONFIG`, `$XDG_CONFIG_HOME/q-cli/servers.conf`, or `~/.config/q-cli/servers.conf`).
-pub fn global_path() -> PathBuf {
-    if let Ok(p) = std::env::var("Q_CLI_CONFIG") {
+/// The global config path (`$Q_CLI_CONFIG`, `$XDG_CONFIG_HOME/q-cli/servers.conf`,
+/// or `~/.config/q-cli/servers.conf`).
+#[must_use]
+fn global_path() -> PathBuf {
+    let q_cfg = std::env::var("Q_CLI_CONFIG").ok();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    global_path_from(q_cfg.as_deref(), xdg.as_deref(), home.as_deref())
+}
+
+fn global_path_from(
+    q_cli_config: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> PathBuf {
+    if let Some(p) = q_cli_config {
         return PathBuf::from(p);
     }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    if let Some(xdg) = xdg_config_home {
         let mut p = PathBuf::from(xdg);
         p.push("q-cli");
         p.push("servers.conf");
         return p;
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    let mut p = PathBuf::from(home);
+    let mut p = PathBuf::from(home.unwrap_or_default());
     p.push(".config");
     p.push("q-cli");
     p.push("servers.conf");
@@ -83,7 +98,7 @@ fn parse(text: &str) -> HashMap<String, String> {
         }
         if let Some((k, mut v)) = line.split_once('=') {
             let k = k.trim();
-            // Strip inline comments preceded by whitespace (e.g. ` # comment` or `\t# comment`)
+            // Strip inline comments preceded by whitespace (` # comment` or `\t# comment`)
             if let Some((val_part, _)) = v.split_once(" #") {
                 v = val_part;
             } else if let Some((val_part, _)) = v.split_once("\t#") {
@@ -119,10 +134,10 @@ fn load_merged() -> Result<HashMap<String, String>, String> {
         }
     }
     if map.is_empty() {
+        let g_disp = global_path().display().to_string();
         return Err(format!(
-            "no servers configured (global {} or a project {}); run `q-cli config init`",
-            global_path().display(),
-            PROJECT_FILE
+            "no servers configured (global {g_disp} or a project {PROJECT_FILE}); \
+             run `q-cli config init`"
         ));
     }
     Ok(map)
@@ -138,34 +153,31 @@ pub fn resolve_conn(token: &str) -> Result<String, String> {
     resolve_alias(key, &servers)
 }
 
-pub fn resolve_alias(key: &str, servers: &HashMap<String, String>) -> Result<String, String> {
-    let mut current = key.strip_prefix('@').unwrap_or(key).to_string();
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(current.clone());
+fn resolve_alias(key: &str, servers: &HashMap<String, String>) -> Result<String, String> {
+    let mut current = key.strip_prefix('@').unwrap_or(key);
+    let mut visited: HashSet<&str> = HashSet::from([current]);
 
     let mut val = servers
-        .get(&current)
-        .cloned()
-        .ok_or_else(|| format!("unknown server '{}' (not in global/project config)", current))?;
+        .get(current)
+        .map(String::as_str)
+        .ok_or_else(|| format!("unknown server '{current}' (not in global/project config)"))?;
 
     let mut hops = 0;
     while !val.contains(':') {
         hops += 1;
-        let next_key = val.strip_prefix('@').unwrap_or(&val).to_string();
-        if hops > 16 || visited.contains(&next_key) {
+        let next_key = val.strip_prefix('@').unwrap_or(val);
+        if hops > 16 || !visited.insert(next_key) {
             return Err(format!(
-                "alias cycle or too many redirects starting at '{}'",
-                key
+                "alias cycle or too many redirects starting at '{key}'"
             ));
         }
-        visited.insert(next_key.clone());
         current = next_key;
         val = servers
-            .get(&current)
-            .cloned()
-            .ok_or_else(|| format!("server '{}' points at undefined '{}'", current, val))?;
+            .get(current)
+            .map(String::as_str)
+            .ok_or_else(|| format!("server '{current}' points at undefined '{val}'"))?;
     }
-    Ok(val)
+    Ok(val.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +195,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let project = args.iter().any(|a| a == "--project" || a == "-p");
     let rest: Vec<&str> = args
         .iter()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .filter(|a| *a != "--project" && *a != "-p")
         .collect();
     let action = rest.first().copied().unwrap_or("path");
@@ -194,23 +206,56 @@ pub fn run(args: &[String]) -> Result<String, String> {
     };
 
     match action {
-        "init" => init(&target),
-        "path" => Ok(path_summary()),
-        "list" => list(),
+        "init" => {
+            if let Some(extra) = rest.get(1) {
+                return Err(format!("unexpected argument '{extra}' for 'config init'"));
+            }
+            init(&target)
+        }
+        "path" => {
+            if let Some(extra) = rest.get(1) {
+                return Err(format!("unexpected argument '{extra}' for 'config path'"));
+            }
+            Ok(path_summary())
+        }
+        "list" => {
+            if let Some(extra) = rest.get(1) {
+                return Err(format!("unexpected argument '{extra}' for 'config list'"));
+            }
+            Ok(list())
+        }
         "add" => {
             let name = rest
                 .get(1)
                 .ok_or("usage: q-cli config add [--project] <name> <host:port[:user:pass]>")?;
-            let conn = rest
+            let conn_str = rest
                 .get(2)
                 .ok_or("usage: q-cli config add [--project] <name> <host:port[:user:pass]>")?;
-            add(&target, name, conn)
+            if let Some(extra) = rest.get(3) {
+                return Err(format!("unexpected argument '{extra}' for 'config add'"));
+            }
+            add(&target, name, conn_str)
         }
         other => Err(format!(
-            "unknown config action '{}' (init | path | list | add) [--project]",
-            other
+            "unknown config action '{other}' (init | path | list | add) [--project]"
         )),
     }
+}
+
+fn write_config_file(target: &Path, content: &str) -> Result<(), String> {
+    if let Some(dir) = target.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+    }
+    fs::write(target, content).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn init(target: &Path) -> Result<String, String> {
@@ -220,12 +265,7 @@ fn init(target: &Path) -> Result<String, String> {
             target.display()
         ));
     }
-    if let Some(dir) = target.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
-        }
-    }
-    fs::write(target, TEMPLATE).map_err(|e| format!("cannot write {}: {}", target.display(), e))?;
+    write_config_file(target, TEMPLATE)?;
     Ok(format!(
         "created {}\nedit it so `default` points at your q process, then: q-cli tables @",
         target.display()
@@ -234,26 +274,28 @@ fn init(target: &Path) -> Result<String, String> {
 
 fn path_summary() -> String {
     let g = global_path();
-    let mut s = format!(
-        "global:  {}   ({})",
-        g.display(),
-        if g.exists() { "exists" } else { "none" }
-    );
+    let status = if g.exists() { "exists" } else { "none" };
+    let mut s = format!("global:  {}   ({status})", g.display());
     match project_path_read() {
-        Some(p) => s.push_str(&format!("\nproject: {}   (active)", p.display())),
-        None => s.push_str(&format!(
-            "\nproject: {}   (none here)",
-            project_path_write().display()
-        )),
+        Some(p) => {
+            let _ = write!(s, "\nproject: {}   (active)", p.display());
+        }
+        None => {
+            let _ = write!(
+                s,
+                "\nproject: {}   (none here)",
+                project_path_write().display()
+            );
+        }
     }
     if let Ok(e) = std::env::var("Q_CLI_CONFIG") {
-        s.push_str(&format!("\nenv Q_CLI_CONFIG: {}   (used alone)", e));
+        let _ = write!(s, "\nenv Q_CLI_CONFIG: {e}   (used alone)");
     }
     s
 }
 
 /// Effective servers, annotated with their source (project overrides global).
-fn list() -> Result<String, String> {
+fn list() -> String {
     let mut rows: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
     if std::env::var("Q_CLI_CONFIG").is_ok() {
         if let Ok(m) = load_file(&global_path()) {
@@ -276,109 +318,117 @@ fn list() -> Result<String, String> {
         }
     }
     if rows.is_empty() {
-        return Ok("(no servers configured)".to_string());
+        return "(no servers configured)".to_string();
     }
-    Ok(rows
+    let formatted: Vec<String> = rows
         .iter()
-        .map(|(k, (v, src))| format!("{} = {}   [{}]", k, mask(v), src))
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .map(|(k, (v, src))| format!("{k} = {}   [{src}]", mask(v)))
+        .collect();
+    formatted.join("\n")
 }
 
 /// Add or update one entry in `target`, preserving existing lines and comments.
-fn add(target: &Path, name: &str, conn: &str) -> Result<String, String> {
+fn add(target: &Path, name: &str, conn_str: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("profile name cannot be empty".to_string());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
-            "invalid profile name '{}' (must contain only alphanumeric characters, '-', or '_')",
-            name
+            "invalid profile name '{name}' \
+             (must contain only alphanumeric characters, '-', or '_')"
         ));
     }
-    let conn = conn.trim();
-    if conn.is_empty() {
+    let conn_str = conn_str.trim();
+    if conn_str.is_empty() {
         return Err("connection target cannot be empty".to_string());
     }
-    if conn.contains(':') {
-        crate::conn::parse_conn(conn)
-            .map_err(|e| format!("invalid connection string '{}': {}", conn, e.msg))?;
+    if conn_str.chars().any(char::is_control)
+        || conn_str.contains(" #")
+        || conn_str.contains("\t#")
+    {
+        return Err(
+            "invalid connection target (cannot contain control characters or inline comments)"
+                .to_string(),
+        );
+    }
+    if conn_str.contains(':') {
+        conn::parse_conn(conn_str)
+            .map_err(|e| format!("invalid connection string '{conn_str}': {}", e.msg))?;
     } else {
-        let alias = conn.strip_prefix('@').unwrap_or(conn);
-        if alias.is_empty() || !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        let alias = conn_str.strip_prefix('@').unwrap_or(conn_str);
+        let valid_alias = !alias.is_empty()
+            && alias
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid_alias {
             return Err(format!(
-                "invalid alias target '{}' (must be a valid profile name or host:port)",
-                conn
+                "invalid alias target '{conn_str}' (must be a valid profile name or host:port)"
             ));
         }
     }
 
-    if let Some(dir) = target.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
-        }
-    }
     let mut lines: Vec<String> = if target.exists() {
         fs::read_to_string(target)
-            .map_err(|e| format!("cannot read {}: {}", target.display(), e))?
+            .map_err(|e| format!("cannot read {}: {e}", target.display()))?
             .lines()
-            .map(|s| s.to_string())
+            .map(str::to_string)
             .collect()
     } else {
         vec!["# q-cli server profiles".to_string()]
     };
 
     let mut replaced = false;
-    for line in lines.iter_mut() {
+    for line in &mut lines {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
         if let Some((k, _)) = t.split_once('=') {
             if k.trim() == name {
-                *line = format!("{} = {}", name, conn);
+                *line = format!("{name} = {conn_str}");
                 replaced = true;
                 break;
             }
         }
     }
     if !replaced {
-        lines.push(format!("{} = {}", name, conn));
+        lines.push(format!("{name} = {conn_str}"));
     }
 
     let mut body = lines.join("\n");
     body.push('\n');
-    fs::write(target, body).map_err(|e| format!("cannot write {}: {}", target.display(), e))?;
+    write_config_file(target, &body)?;
+    let verb = if replaced { "updated" } else { "added" };
     Ok(format!(
-        "{} {} = {}  ({})",
-        if replaced { "updated" } else { "added" },
-        name,
-        mask(conn),
+        "{verb} {name} = {}  ({})",
+        mask(conn_str),
         target.display()
     ))
 }
 
-/// Hide the password component of a host:port:user:pass connection string.
-fn mask(conn: &str) -> String {
-    if let Ok((host, port, creds)) = crate::conn::parse_conn(conn) {
+/// Hide the password/secret component of a `host:port:user:pass` or `host:port:token` string.
+fn mask(conn_str: &str) -> String {
+    if let Ok((host, port, creds)) = conn::parse_conn(conn_str) {
         if !creds.is_empty() {
-            let parts: Vec<&str> = creds.split(':').collect();
-            if parts.len() >= 2 {
-                let user = parts[0];
-                if host.contains(':') {
-                    format!("[{}]:{}:{}:****", host, port, user)
-                } else {
-                    format!("{}:{}:{}:****", host, port, user)
-                }
+            let host_fmt = if host.contains(':') {
+                format!("[{host}]")
             } else {
-                conn.to_string()
+                host.to_string()
+            };
+            if let Some((user, _)) = creds.split_once(':') {
+                format!("{host_fmt}:{port}:{user}:****")
+            } else {
+                format!("{host_fmt}:{port}:****")
             }
         } else {
-            conn.to_string()
+            conn_str.to_string()
         }
     } else {
-        conn.to_string()
+        conn_str.to_string()
     }
 }
 
@@ -396,7 +446,9 @@ mod tests {
 
     #[test]
     fn parse_strips_inline_comments() {
-        let m = parse("dev = localhost:5000 # primary dev kdb\nprod = [::1]:5001:user:pass#word\t# prod");
+        let m = parse(
+            "dev = localhost:5000 # primary dev kdb\nprod = [::1]:5001:user:pass#word\t# prod",
+        );
         assert_eq!(m.get("dev").map(String::as_str), Some("localhost:5000"));
         // # without preceding whitespace in password is preserved
         assert_eq!(
@@ -414,11 +466,9 @@ mod tests {
     #[test]
     fn mask_hides_only_the_password() {
         assert_eq!(mask("host:5000:user:secret"), "host:5000:user:****");
+        assert_eq!(mask("host:5000:token_only"), "host:5000:****");
         assert_eq!(mask("host:5000"), "host:5000"); // nothing to hide
-        assert_eq!(
-            mask("[::1]:5000:user:secret"),
-            "[::1]:5000:user:****"
-        );
+        assert_eq!(mask("[::1]:5000:user:secret"), "[::1]:5000:user:****");
     }
 
     #[test]
@@ -456,32 +506,44 @@ mod tests {
             resolve_alias("default", &servers).unwrap(),
             "cluster:5000"
         );
-        assert_eq!(resolve_alias("@default", &servers).unwrap(), "cluster:5000");
+        assert_eq!(
+            resolve_alias("@default", &servers).unwrap(),
+            "cluster:5000"
+        );
     }
 
     #[test]
     fn add_validation_rejects_invalid_names_and_conns() {
-        let dummy = Path::new("dummy.conf");
-        assert!(add(dummy, "bad:name", "localhost:5000").is_err());
-        assert!(add(dummy, "bad name", "localhost:5000").is_err());
-        assert!(add(dummy, "bad=name", "localhost:5000").is_err());
-        assert!(add(dummy, "", "localhost:5000").is_err());
-        assert!(add(dummy, "good-name_1", "localhost:not_a_port").is_err());
-        assert!(add(dummy, "good-name_1", "bad alias with spaces").is_err());
-        assert!(add(dummy, "good-name_1", "").is_err());
-        assert!(add(dummy, "good-name_1", "@target_alias").is_ok());
-        assert!(add(dummy, "good-name_1", "target_alias").is_ok());
+        let dummy = std::env::temp_dir().join(format!("q-cli-test-{}.conf", std::process::id()));
+        assert!(add(&dummy, "bad:name", "localhost:5000").is_err());
+        assert!(add(&dummy, "bad name", "localhost:5000").is_err());
+        assert!(add(&dummy, "bad=name", "localhost:5000").is_err());
+        assert!(add(&dummy, "", "localhost:5000").is_err());
+        assert!(add(&dummy, "good-name_1", "localhost:not_a_port").is_err());
+        assert!(add(&dummy, "good-name_1", "bad alias with spaces").is_err());
+        assert!(add(&dummy, "good-name_1", "localhost:5000:u:p # comment").is_err());
+        assert!(add(&dummy, "good-name_1", "localhost:5000:u:p\nevil=1:2").is_err());
+        assert!(add(&dummy, "good-name_1", "").is_err());
+        assert!(add(&dummy, "good-name_1", "@target_alias").is_ok());
+        assert!(add(&dummy, "good-name_1", "target_alias").is_ok());
+        assert!(run(&["list".into(), "extra".into()]).is_err());
+        assert!(run(&["add".into(), "a".into(), "localhost:5000".into(), "extra".into()]).is_err());
+        let _ = fs::remove_file(&dummy);
     }
 
     #[test]
     fn global_path_resolution() {
-        std::env::set_var("Q_CLI_CONFIG", "/custom/path/servers.conf");
-        assert_eq!(global_path(), PathBuf::from("/custom/path/servers.conf"));
-        std::env::remove_var("Q_CLI_CONFIG");
-
-        std::env::set_var("XDG_CONFIG_HOME", "/xdg/config");
-        assert_eq!(global_path(), PathBuf::from("/xdg/config/q-cli/servers.conf"));
-        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(
+            global_path_from(Some("/custom/path/servers.conf"), Some("/xdg"), Some("/home")),
+            PathBuf::from("/custom/path/servers.conf")
+        );
+        assert_eq!(
+            global_path_from(None, Some("/xdg/config"), Some("/home")),
+            PathBuf::from("/xdg/config/q-cli/servers.conf")
+        );
+        assert_eq!(
+            global_path_from(None, None, Some("/home/user")),
+            PathBuf::from("/home/user/.config/q-cli/servers.conf")
+        );
     }
 }
-

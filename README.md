@@ -1,26 +1,27 @@
 # q-cli
 
 A native **kdb+/q IPC client** in Rust. Connects to a running q process over TCP,
-speaking the kdb+ wire protocol directly — no `q.exe`, no license, no dependencies
-(pure `std`). Single self-contained binary, cross-platform.
+speaking the kdb+ wire protocol directly — no `q.exe`, no license.
+Single self-contained binary, cross-platform.
 
 ## Usage
 ```
 q-cli [OUT] query  <conn> "<q expression>"   # or `-` to read the expr from stdin
 q-cli [OUT] run    <conn> <path.q>           # or `-` to read q source from stdin
 q-cli [OUT] tables <conn>
+q-cli [OUT] views  <conn>
 q-cli [OUT] meta   <conn> <table>
 q-cli [OUT] count  <conn> <table>
 q-cli [OUT] describe <conn> <table>  # partitioning + schema + rows + sample (1 call)
 q-cli [OUT] schema <conn>            # all tables: rows/cols/partition (1 call)
 q-cli [OUT] functions <conn> [ns]    # defined functions + arity (root or .ns)
 q-cli [OUT] info   <conn>            # version, pid, port, memory, handles
-q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count
+q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count (or `-` for stdin)
 q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
 q-cli       ping   <conn>
 q-cli       web    <off|get-ok|status> <conn>   # tune built-in HTTP serving
 q-cli       trace  <on|off|status> <conn>       # .Q.trp backtraces on errors
-q-cli       config <init|path|list|add>
+q-cli       config <init|path|list|add> [--project]
 ```
 
 ```sh
@@ -59,14 +60,15 @@ q-cli config list                    # merged view, each entry tagged [global]/[
 q-cli config path                    # show both layers and which project file is active
 ```
 
-**Output modes & flags** (default: aligned text):
+**Output modes & flags** (default: aligned text, or `Q_CLI_OUT=text|json|csv|console`):
+- `--text` — aligned text table/value output (default; overrides `Q_CLI_OUT`).
 - `--json` / `-j` — JSON. Tables → array of row objects; keyed tables merge
   key+value columns; temporal types → formatted strings.
 - `--csv` — CSV (tables only, RFC4180-escaped, **uncapped**).
 - `--console` — the q server formats the result with `.Q.s` (max fidelity).
-- `--max-rows N` — row cap for text/json (default 50; `0` = unlimited). When a
-  table is capped, a `note: showing N of M rows` is printed to **stderr** so it's
-  machine-detectable; stdout stays pure data.
+- `--max-rows N` (or `Q_CLI_MAX_ROWS`) — row cap for text/json (default 50; `0` =
+  unlimited). When a table is capped, a `note: showing N of M rows` is printed to
+  **stderr** so it's machine-detectable; stdout stays pure data.
 - `--timeout MS` (or `Q_CLI_TIMEOUT`) — how long to wait for the **query
   round-trip** (send + receive), in milliseconds (default `30000`; **`0` = no
   timeout, wait forever**). Also caps the connect at `min(MS, 5000)`. A timeout on
@@ -76,12 +78,18 @@ q-cli config path                    # show both layers and which project file i
   an agent can tell "the query never came back" apart from "can't reach the server".
 - `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
   (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
-  `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`, **not a
-  sandbox** — guards an agent from accidentally mutating data. Keywords inside a
+  `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`/`gc`, **not
+  a sandbox** — guards an agent from accidentally mutating data. Keywords inside a
   string literal (e.g. `… like "*delete*"`) are ignored, so reads aren't
   false-blocked. It also blocks the
   server-mutating `web off`/`web get-ok` and `trace on`/`trace off` (which rebind
   `.z.*` handlers); the `status` forms stay allowed.
+- `--scoped` — wrap evaluations (`query`/`time`/`run`) in `{[] ... }[]` so temporary
+  assignments stay local and never pollute server globals.
+- `--atomic` — execute a `.q` script (`run`) as a single protected IPC evaluation
+  instead of statement by statement.
+- `--dry-run` — validate every statement (`query`/`time`/`run`) on the server with
+  `parse` without executing or mutating state.
 
 **Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
 unknown server, readonly block) · `3` connection (refused/unreachable/auth, incl.
@@ -145,13 +153,18 @@ kdb+ algorithm; loopback connections are never compressed.
 ## Layout
 | file | role |
 |------|------|
-| [src/main.rs](src/main.rs)     | CLI args, connection, handshake, sync send/recv |
+| [src/main.rs](src/main.rs)     | CLI flag parsing and entry point |
+| [src/cmd.rs](src/cmd.rs)       | `CMDS` command table, dispatch, script splitting, and readonly guard |
+| [src/config.rs](src/config.rs) | Server-profile configuration (global and project layers) |
+| [src/conn.rs](src/conn.rs)     | TCP connection, kdb+ handshake, and sync IPC send/recv |
+| [src/error.rs](src/error.rs)   | Error classification (`Kind`, `CliError`) and exit codes |
 | [src/k.rs](src/k.rs)           | K type model, wire deserialization, temporal formatting, decompress |
-| [src/render.rs](src/render.rs) | text & JSON rendering |
+| [src/query.rs](src/query.rs)   | Built-in q expressions (`info`, `schema`, `describe`, `functions`, `time`) |
+| [src/render.rs](src/render.rs) | Text, JSON, and CSV rendering |
 
 ## Build & install
 ```sh
-cargo build --release            # in D:\q\q-cli
+cargo build --release
 cp target/release/q-cli.exe ~/.local/bin/    # (Windows: Copy-Item ... )
 ```
 

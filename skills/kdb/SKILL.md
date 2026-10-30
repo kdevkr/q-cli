@@ -17,16 +17,16 @@ kdb+ wire protocol directly over TCP. No `q.exe`, no license, no startup noise.
 ```
 q-cli [OUT] query    <conn> "<q expr>"|-   run a q expr   (- = stdin)
 q-cli [OUT] run      <conn> <path.q>|-     send a .q file (- = stdin)
-q-cli [OUT] tables|meta|count|describe|schema <conn> [table]   schema discovery
+q-cli [OUT] tables|views|meta|count|describe|schema <conn> [table]   schema discovery
 q-cli [OUT] functions <conn> [ns]          server-side helpers + arity
-q-cli [OUT] info|time <conn> ["<q expr>"]  health snapshot / profile a query
+q-cli [OUT] info|time <conn> ["<q expr>"|-] health snapshot / profile a query
 q-cli       gc|ping  <conn>                .Q.gc[] / liveness probe
 q-cli       web|trace <action> <conn>      HTTP tuning / error backtraces
 q-cli       config   <init|path|list|add>  server profiles
 ```
 
 - **`query`/`run`** run a q expr / send a `.q` file (`-` = read from stdin).
-- **`tables`/`meta`/`count`/`describe`/`schema`** — schema discovery. `schema`
+- **`tables`/`views`/`meta`/`count`/`describe`/`schema`** — schema discovery. `schema`
   maps the **whole process** in one call (rows/cols/partition per table) and
   `describe <t>` profiles **one table** in one call (partitioning + columns + rows
   + sample). Start with `schema`, then `describe` the tables you care about.
@@ -41,9 +41,10 @@ q-cli       config   <init|path|list|add>  server profiles
 - **`<conn>`** — `host:port[:user:pass]`, or a config name (`@name`/`name` →
   config; `@`/`default` → default). Config is global + project (project wins);
   set up with `q-cli config init`.
-- **`[OUT]`** (default aligned text, 50-row cap) — `--json` (array of row objects)
-  · `--csv` (uncapped) · `--console` (q formats via `.Q.s`) · `--max-rows N`
-  (0 = all) · `--timeout MS` (0 = forever) · `--readonly` (refuse mutating q).
+- **`[OUT]`** (default aligned text, 50-row cap) — `--text` · `--json` (array of
+  row objects) · `--csv` (uncapped) · `--console` (q formats via `.Q.s`) ·
+  `--max-rows N` (0 = all) · `--timeout MS` (0 = forever) · `--readonly` (refuse
+  mutating q) · `--scoped` · `--atomic` · `--dry-run`.
 - **Exit codes** — branch on these, not text: `0` ok · `2` usage/policy · `3`
   connection (refused/unreachable) · `4` q error · `5` timeout (query too slow —
   **not** a refused connection). `--json` errors: `{"error","kind"}` on stderr.

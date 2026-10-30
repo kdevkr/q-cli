@@ -4,7 +4,7 @@
 //! message -> deserialize the returned K object). No q.exe, no license.
 //!
 //! Layout:
-//!   error.rs  — `Kind`/`E`/exit codes + timeout classification
+//!   error.rs  — `Kind`/`CliError`/exit codes + timeout classification
 //!   conn.rs   — the IPC protocol (`Conn`: open/handshake/sync)
 //!   query.rs  — the canned q expressions the CLI sends + q-string escaping
 //!   cmd.rs    — the `CMDS` command table, dispatch, output rendering, guards
@@ -27,29 +27,31 @@ mod query;
 mod render;
 
 use cmd::{Opts, OutMode};
+use error::CliError;
 
 fn main() {
     std::process::exit(real_main());
 }
 
+fn usage_err(msg: &str, out: OutMode) -> i32 {
+    let opts = Opts {
+        out,
+        ..Opts::default()
+    };
+    cmd::finish(Err(CliError::usage(msg)), &opts)
+}
+
 fn real_main() -> i32 {
-    let mut out = std::env::var("Q_CLI_OUT")
+    let mut out: OutMode = std::env::var("Q_CLI_OUT")
         .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "json" => Some(OutMode::Json),
-            "csv" => Some(OutMode::Csv),
-            "console" => Some(OutMode::Console),
-            "text" => Some(OutMode::Text),
-            _ => None,
-        })
-        .unwrap_or(OutMode::Text);
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
     let mut max_rows: usize = std::env::var("Q_CLI_MAX_ROWS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
     let mut readonly = std::env::var("Q_CLI_READONLY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut scoped = false;
     let mut atomic = false;
     let mut dry_run = false;
@@ -74,6 +76,7 @@ fn real_main() -> i32 {
                 }
                 break;
             }
+            "--text" => out = OutMode::Text,
             "--json" | "-j" => out = OutMode::Json,
             "--csv" => out = OutMode::Csv,
             "--console" => out = OutMode::Console,
@@ -84,21 +87,22 @@ fn real_main() -> i32 {
             "--project" | "-p" => project = true,
             "--max-rows" => {
                 i += 1;
-                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                let parsed: Option<usize> = args.get(i).and_then(|v| v.parse().ok());
+                match parsed {
                     Some(n) => max_rows = n,
-                    None => {
-                        eprintln!("ERR --max-rows requires a numeric value");
-                        return 2;
-                    }
+                    None => return usage_err("--max-rows requires a numeric value", out),
                 }
             }
             "--timeout" => {
                 i += 1;
-                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                let parsed: Option<u64> = args.get(i).and_then(|v| v.parse().ok());
+                match parsed {
                     Some(n) => timeout_ms = n,
                     None => {
-                        eprintln!("ERR --timeout requires a numeric value (ms; 0 = no timeout)");
-                        return 2;
+                        return usage_err(
+                            "--timeout requires a numeric value (ms; 0 = no timeout)",
+                            out,
+                        );
                     }
                 }
             }
@@ -110,28 +114,33 @@ fn real_main() -> i32 {
                 println!("q-cli {}", env!("CARGO_PKG_VERSION"));
                 return 0;
             }
-            s if s.starts_with("--max-rows=") => match s[11..].parse::<usize>() {
-                Ok(n) => max_rows = n,
-                Err(_) => {
-                    eprintln!("ERR --max-rows requires a numeric value");
-                    return 2;
+            s if s.starts_with("--max-rows=") => {
+                let parsed: Result<usize, _> = s[11..].parse();
+                match parsed {
+                    Ok(n) => max_rows = n,
+                    Err(_) => return usage_err("--max-rows requires a numeric value", out),
                 }
-            },
-            s if s.starts_with("--timeout=") => match s[10..].parse::<u64>() {
-                Ok(n) => timeout_ms = n,
-                Err(_) => {
-                    eprintln!("ERR --timeout requires a numeric value (ms; 0 = no timeout)");
-                    return 2;
+            }
+            s if s.starts_with("--timeout=") => {
+                let parsed: Result<u64, _> = s[10..].parse();
+                match parsed {
+                    Ok(n) => timeout_ms = n,
+                    Err(_) => {
+                        return usage_err(
+                            "--timeout requires a numeric value (ms; 0 = no timeout)",
+                            out,
+                        );
+                    }
                 }
-            },
+            }
             s if s.starts_with('-') && s != "-" => {
-                if pos.len() >= 2 && matches!(pos[0].as_str(), "query" | "time") {
-                    pos.push(args[i].clone());
-                } else if pos.first().map(|s| s.as_str()) == Some("config") {
+                // Allow a leading `-` in `<expr>` position (`pos[2]`) for `query`/`time`
+                // so negative literals or adverbs like `-1+2` or `-0W` work without `--`.
+                let is_query_expr = pos.len() == 2 && matches!(pos[0].as_str(), "query" | "time");
+                if is_query_expr {
                     pos.push(args[i].clone());
                 } else {
-                    eprintln!("ERR unrecognized option '{}'", s);
-                    return 2;
+                    return usage_err(&format!("unrecognized option '{s}'"), out);
                 }
             }
             _ => pos.push(args[i].clone()),
@@ -140,13 +149,12 @@ fn real_main() -> i32 {
     }
 
     if project {
-        if pos.first().map(|s| s.as_str()) == Some("config") {
+        if pos.first().map(String::as_str) == Some("config") {
             if !pos.iter().any(|a| a == "--project" || a == "-p") {
                 pos.push("--project".to_string());
             }
         } else {
-            eprintln!("ERR unrecognized option '--project'");
-            return 2;
+            return usage_err("unrecognized option '--project'", out);
         }
     }
     let opts = Opts {

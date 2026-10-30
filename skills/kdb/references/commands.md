@@ -9,18 +9,19 @@ code. SKILL.md carries the quick summary; read this when you need the specifics.
 q-cli [OUT] query    <conn> "<q expression>"   # or `-` to read the expr from stdin
 q-cli [OUT] run      <conn> <path.q>           # or `-` to read q source from stdin
 q-cli [OUT] tables   <conn>
+q-cli [OUT] views    <conn>
 q-cli [OUT] meta     <conn> <table>
 q-cli [OUT] count    <conn> <table>
 q-cli [OUT] describe <conn> <table>
 q-cli [OUT] schema   <conn>
 q-cli [OUT] functions <conn> [ns]
 q-cli [OUT] info     <conn>
-q-cli [OUT] time     <conn> "<q expr>"
+q-cli [OUT] time     <conn> "<q expr>"         # or `-` to read the expr from stdin
 q-cli       gc     <conn>
 q-cli       ping   <conn>
 q-cli       web    <off|get-ok|status> <conn>
 q-cli       trace  <on|off|status>     <conn>
-q-cli       config <init|path|list|add>
+q-cli       config <init|path|list|add> [--project]
 q-cli       --version | -V | --help | -h
 ```
 
@@ -28,10 +29,10 @@ q-cli       --version | -V | --help | -h
 
 - **`query`** → run a q expression, print result. **`run`** → send a `.q` file
   (splits into top-level statements by q rules, sequentially executed with line-number error reporting).
-  Both accept `-` as the argument to read the q source from **stdin** (pipe a
-  generated or multi-line expression).
+  Both (plus `time`) accept `-` as the argument to read the q source from **stdin**
+  (pipe a generated or multi-line expression).
 - **`ping`** → `pong` if the handshake succeeds.
-- **`tables`** / **`meta <t>`** / **`count <t>`** → fast schema discovery.
+- **`tables`** / **`views`** / **`meta <t>`** / **`count <t>`** → fast schema discovery.
 - **`describe <t>`** → partitioning (`.Q.qp`/`.Q.pf`) + columns/types (`meta`) + row
   count + a small sample, in **one** call (JSON-friendly). Prefer this as the first
   look at an unknown table — it surfaces the partition column so you know what to
@@ -74,26 +75,29 @@ First-time setup:
   masked).
 - `q-cli config path` shows both layers and which project file is active.
 
-## `[OUT]` — output mode (default: aligned text, capped at 50 rows)
+## `[OUT]` — output mode (default: aligned text, capped at 50 rows; or `Q_CLI_OUT`)
 
-- `--json` → JSON; tables → **array of row objects**, keyed tables merge key+value.
+- `--text` → aligned text output (default; overrides `Q_CLI_OUT`).
+- `--json` / `-j` → JSON; tables → **array of row objects**, keyed tables merge key+value.
 - `--csv` → CSV (tables only, **uncapped** — for export/piping).
 - `--console` → let the **q server** format via `.Q.s` (max fidelity for exotic /
   deeply-nested types).
-- `--max-rows N` → cap text/json at N rows (default 50; `0` = unlimited). On a cap,
-  a `note: showing N of M rows` goes to **stderr** (stdout stays pure data) — use a
-  small N to save context, `0` when you need every row.
+- `--max-rows N` (or `Q_CLI_MAX_ROWS`) → cap text/json at N rows (default 50; `0` =
+  unlimited). On a cap, a `note: showing N of M rows` goes to **stderr** (stdout
+  stays pure data) — use a small N to save context, `0` when you need every row.
 - `--timeout MS` (or `Q_CLI_TIMEOUT`) → how long to wait for the query round-trip,
   ms (default 30000; **`0` = wait forever**; also caps connect at 5000). Only a
   round-trip timeout is **exit 5** (the query is too slow); an unreachable host or
   connect timeout is **exit 3**. Raise it before a known-heavy `select` (or use
   `0`); lower it (e.g. `--timeout 3000`) for a quick liveness probe.
 - `--readonly` (or `Q_CLI_READONLY=1`) → refuse mutating q (`delete`/`update`/`set`/
-  `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`, and block the
+  `hdel`/`system`/`exit`/`0:`…) on `query`/`run`/`time`/`gc`, and block the
   server-mutating `web off`/`web get-ok` / `trace on`/`trace off` (their `status`
   forms stay allowed). Heuristic, not a sandbox; keywords inside a string literal
   (e.g. `… like "*delete*"`) are ignored so reads aren't false-blocked.
-- `--scoped` → evaluate expression inside `{[] ... }[]` so assignments do not pollute server globals.
+- `--scoped` → evaluate expression (`query`/`time`/`run`) inside `{[] ... }[]` so assignments do not pollute server globals.
+- `--atomic` → run `.q` script (`run`) as a single atomic protected block.
+- `--dry-run` → validate syntax (`query`/`time`/`run`) on the server with `parse` without mutating state.
 
 ## Exit codes — branch on these instead of parsing text
 

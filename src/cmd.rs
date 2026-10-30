@@ -2,33 +2,57 @@
 //! the usage text, and the unknown-command list are all derived from it, so
 //! adding a command is one row here — not three edits across the file.
 
+use std::fmt::Write as _;
+use std::io::{Read, Write};
 use std::time::Duration;
 
+use crate::config;
 use crate::conn::Conn;
-use crate::error::{E, R};
+use crate::error::{CliError, CmdResult};
 use crate::k::K;
-use crate::query::{self, q_escape};
-use crate::{config, render};
+use crate::query;
+use crate::render;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum OutMode {
+    #[default]
     Text,
     Json,
     Csv,
     Console,
 }
 
+impl std::str::FromStr for OutMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("text") {
+            Ok(Self::Text)
+        } else if s.eq_ignore_ascii_case("json") {
+            Ok(Self::Json)
+        } else if s.eq_ignore_ascii_case("csv") {
+            Ok(Self::Csv)
+        } else if s.eq_ignore_ascii_case("console") {
+            Ok(Self::Console)
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Opts {
     pub out: OutMode,
     pub max_rows: usize, // 0 = unlimited
     pub readonly: bool,
     pub scoped: bool,
-    pub atomic: bool,   // execute entire script in a single atomic block
-    pub dry_run: bool,  // simulate execution in an isolated sandbox to verify syntax and runtime without mutations
+    pub atomic: bool,  // execute entire script in a single atomic block
+    pub dry_run: bool, // validate syntax on server without mutating state
     pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
 /// One CLI command, expressed as data.
+#[derive(Debug, Clone, Copy)]
 pub struct Cmd {
     pub name: &'static str,
     pub help: &'static str,
@@ -37,82 +61,212 @@ pub struct Cmd {
 
 /// How a command turns its positional args into work. Most commands are `Eval`
 /// (build a q expression from the trailing arg, run it, render the result); the
-/// other three variants capture the only real exceptions.
+/// other variants capture the only real exceptions.
+#[derive(Debug, Clone, Copy)]
 pub enum Spec {
     /// `<conn> [arg]` — build a q expression from `arg`, eval, render.
-    /// `guard` runs the readonly check on the *built* expression first.
-    Eval { build: fn(&str) -> R, guard: bool },
+    /// `guard` resolves stdin (`-`) and runs the readonly + remote-function
+    /// checks on the user expression before evaluating.
+    Eval {
+        build: fn(&str) -> CmdResult,
+        guard: bool,
+    },
     /// `<conn> <path.q>` — read .q file, split into statements, sequentially execute.
     Run,
     /// `<conn>` — handshake probe; prints `pong`.
     Ping,
     /// `<action> <conn>` — map `action` to a fixed q expression (web / trace).
     /// Note the reversed arg order: the action comes before the connection.
-    Action(fn(&str) -> R),
+    Action(fn(&str) -> CmdResult),
     /// `<args...>` — no connection (config profile management).
     Config,
 }
 
 pub const CMDS: &[Cmd] = &[
-    Cmd { name: "query", help: "<conn> \"<q expr>\"|-        run a q expression (- = stdin)",
-          spec: Spec::Eval { build: build_query, guard: true } },
-    Cmd { name: "run", help: "<conn> <path.q>|-          send a .q file (- = stdin)",
-          spec: Spec::Run },
-    Cmd { name: "tables", help: "<conn>                     list tables",
-          spec: Spec::Eval { build: |_| Ok("tables[]".to_string()), guard: false } },
-    Cmd { name: "views", help: "<conn>                      list views",
-          spec: Spec::Eval { build: |_| Ok("views[]".to_string()), guard: false } },
-    Cmd { name: "meta", help: "<conn> <table>             column schema",
-          spec: Spec::Eval { build: |t| need_table(t).map(|t| format!("meta {}", t)), guard: false } },
-    Cmd { name: "count", help: "<conn> <table>             row count",
-          spec: Spec::Eval { build: |t| need_table(t).map(|t| format!("count {}", t)), guard: false } },
-    Cmd { name: "describe", help: "<conn> <table>             partitioning+schema+rows+sample",
-          spec: Spec::Eval { build: |t| need_table(t).map(query::describe_q), guard: false } },
-    Cmd { name: "schema", help: "<conn>                     all tables: rows/cols/partition",
-          spec: Spec::Eval { build: |_| Ok(query::SCHEMA_Q.to_string()), guard: false } },
-    Cmd { name: "functions", help: "<conn> [ns]                defined functions + arity",
-          spec: Spec::Eval { build: |ns| Ok(query::functions_q(ns)), guard: false } },
-    Cmd { name: "info", help: "<conn>                     version/pid/port/mem/handles",
-          spec: Spec::Eval { build: |_| Ok(query::INFO_Q.to_string()), guard: false } },
-    Cmd { name: "time", help: "<conn> \"<q expr>\"          elapsed ms + result count",
-          spec: Spec::Eval { build: build_time, guard: true } },
-    Cmd { name: "gc", help: "<conn>                     .Q.gc[] -> bytes freed to OS",
-          spec: Spec::Eval { build: |_| Ok(".Q.gc[]".to_string()), guard: false } },
-    Cmd { name: "ping", help: "<conn>                     handshake probe -> pong",
-          spec: Spec::Ping },
-    Cmd { name: "web", help: "<off|get-ok|status> <conn> tune built-in HTTP serving",
-          spec: Spec::Action(web_expr) },
-    Cmd { name: "trace", help: "<on|off|status> <conn>     .Q.trp backtraces on errors",
-          spec: Spec::Action(trace_expr) },
-    Cmd { name: "config", help: "<init|path|list|add> [--project]  manage server profiles",
-          spec: Spec::Config },
+    Cmd {
+        name: "query",
+        help: "<conn> \"<q expr>\"|-        run a q expression (- = stdin)",
+        spec: Spec::Eval {
+            build: build_query,
+            guard: true,
+        },
+    },
+    Cmd {
+        name: "run",
+        help: "<conn> <path.q>|-          send a .q file (- = stdin)",
+        spec: Spec::Run,
+    },
+    Cmd {
+        name: "tables",
+        help: "<conn>                     list tables",
+        spec: Spec::Eval {
+            build: |a| no_extra_arg(a, "tables").map(|()| "tables[]".to_string()),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "views",
+        help: "<conn>                      list views",
+        spec: Spec::Eval {
+            build: |a| no_extra_arg(a, "views").map(|()| "views[]".to_string()),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "meta",
+        help: "<conn> <table>             column schema",
+        spec: Spec::Eval {
+            build: |t| need_table(t).map(|t| format!("meta {t}")),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "count",
+        help: "<conn> <table>             row count",
+        spec: Spec::Eval {
+            build: |t| need_table(t).map(|t| format!("count {t}")),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "describe",
+        help: "<conn> <table>             partitioning+schema+rows+sample",
+        spec: Spec::Eval {
+            build: |t| need_table(t).map(query::describe_q),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "schema",
+        help: "<conn>                     all tables: rows/cols/partition",
+        spec: Spec::Eval {
+            build: |a| no_extra_arg(a, "schema").map(|()| query::SCHEMA_Q.to_string()),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "functions",
+        help: "<conn> [ns]                defined functions + arity",
+        spec: Spec::Eval {
+            build: |ns| need_namespace(ns).map(query::functions_q),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "info",
+        help: "<conn>                     version/pid/port/mem/handles",
+        spec: Spec::Eval {
+            build: |a| no_extra_arg(a, "info").map(|()| query::INFO_Q.to_string()),
+            guard: false,
+        },
+    },
+    Cmd {
+        name: "time",
+        help: "<conn> \"<q expr>\"|-        elapsed ms + result count (- = stdin)",
+        spec: Spec::Eval {
+            build: build_time,
+            guard: true,
+        },
+    },
+    Cmd {
+        name: "gc",
+        help: "<conn>                     .Q.gc[] -> bytes freed to OS",
+        spec: Spec::Eval {
+            build: |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
+            guard: true,
+        },
+    },
+    Cmd {
+        name: "ping",
+        help: "<conn>                     handshake probe -> pong",
+        spec: Spec::Ping,
+    },
+    Cmd {
+        name: "web",
+        help: "<off|get-ok|status> <conn> tune built-in HTTP serving",
+        spec: Spec::Action(web_expr),
+    },
+    Cmd {
+        name: "trace",
+        help: "<on|off|status> <conn>     .Q.trp backtraces on errors",
+        spec: Spec::Action(trace_expr),
+    },
+    Cmd {
+        name: "config",
+        help: "<init|path|list|add> [--project]  manage server profiles",
+        spec: Spec::Config,
+    },
 ];
 
 /// Resolve `pos[0]` against `CMDS` and run it, returning the process exit code.
+#[must_use]
 pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
     let mode = pos[0].as_str();
-    let cmd = match CMDS.iter().find(|c| c.name == mode) {
-        Some(c) => c,
-        None => {
-            let list = CMDS.iter().map(|c| c.name).collect::<Vec<_>>().join("|");
-            return finish(Err(E::usage(format!("unknown mode '{}' ({})", mode, list))), opts);
-        }
+    let Some(cmd) = CMDS.iter().find(|c| c.name == mode) else {
+        let names: Vec<&str> = CMDS.iter().map(|c| c.name).collect();
+        let list = names.join("|");
+        return finish(
+            Err(CliError::usage(&format!("unknown mode '{mode}' ({list})"))),
+            opts,
+        );
     };
 
+    if !matches!(cmd.spec, Spec::Run) && opts.atomic {
+        return finish(
+            Err(CliError::usage(
+                "--atomic is only supported with 'q-cli run'",
+            )),
+            opts,
+        );
+    }
+    let supports_script_flags =
+        matches!(cmd.spec, Spec::Run) || matches!(mode, "query" | "time");
+    if opts.dry_run && !supports_script_flags {
+        return finish(
+            Err(CliError::usage(
+                "--dry-run is only supported with 'query', 'time', and 'run'",
+            )),
+            opts,
+        );
+    }
+    if opts.scoped && !supports_script_flags {
+        return finish(
+            Err(CliError::usage(
+                "--scoped is only supported with 'query', 'time', and 'run'",
+            )),
+            opts,
+        );
+    }
+
     match &cmd.spec {
-        Spec::Config => finish(config::run(&pos[1..]).map_err(E::usage), opts),
+        Spec::Config => finish(
+            config::run(&pos[1..]).map_err(|e| CliError::usage(&e)),
+            opts,
+        ),
         Spec::Action(make) => {
+            if let Some(extra) = pos.get(3) {
+                return finish(
+                    Err(CliError::usage(&format!(
+                        "unexpected extra argument '{extra}' for '{mode}'"
+                    ))),
+                    opts,
+                );
+            }
             // Support both `<action> <conn>` and `<conn> <action>`:
             // e.g. `web off localhost:5000` OR `web localhost:5000 off`
-            let a1 = pos.get(1).map(|s| s.as_str()).unwrap_or("");
-            let a2 = pos.get(2).map(|s| s.as_str()).unwrap_or("");
+            let a1 = pos.get(1).map(String::as_str).unwrap_or("");
+            let a2 = pos.get(2).map(String::as_str).unwrap_or("");
 
-            let (action, conn_tok) = if a1.contains(':') || a1.starts_with('@') || (a1 == "@" && !a2.is_empty()) {
-                (a2, pos.get(1))
-            } else if !a2.is_empty() && (make(a2).is_ok() || a2 == "status") {
-                (a2, pos.get(1))
+            let a1_is_conn =
+                a1.contains(':') || a1.starts_with('@') || (a1 == "@" && !a2.is_empty());
+            let a1_is_action = !a1_is_conn && !a1.is_empty() && make(a1).is_ok();
+            let a2_is_action = !a2.is_empty() && make(a2).is_ok();
+            let (action, conn_tok) = if a1_is_action {
+                (a1, pos.get(2).map(String::as_str))
+            } else if a1_is_conn || a2_is_action {
+                (a2, pos.get(1).map(String::as_str))
             } else {
-                (a1, pos.get(2))
+                (a1, pos.get(2).map(String::as_str))
             };
 
             // Validate the action first (so a bad verb gets its own message),
@@ -122,9 +276,9 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
             match make(action) {
                 Err(e) => finish(Err(e), opts),
                 Ok(_) if opts.readonly && action != "status" => finish(
-                    Err(E::usage(format!(
-                        "readonly: '{} {}' changes server handlers; unset --readonly / Q_CLI_READONLY to allow",
-                        mode, action
+                    Err(CliError::usage(&format!(
+                        "readonly: '{mode} {action}' changes server handlers; \
+                         unset --readonly / Q_CLI_READONLY to allow"
                     ))),
                     opts,
                 ),
@@ -132,65 +286,202 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
             }
         }
         // <conn> — handshake probe.
-        Spec::Ping => match resolve(pos.get(1), mode) {
-            Ok(conn) => finish(do_ping(&conn, opts), opts),
-            Err(e) => finish(Err(e), opts),
-        },
+        Spec::Ping => {
+            if let Some(extra) = pos.get(2) {
+                return finish(
+                    Err(CliError::usage(&format!(
+                        "unexpected extra argument '{extra}' for 'ping'"
+                    ))),
+                    opts,
+                );
+            }
+            match resolve(pos.get(1).map(String::as_str), mode) {
+                Ok(conn) => finish(do_ping(&conn, opts), opts),
+                Err(e) => finish(Err(e), opts),
+            }
+        }
         Spec::Run => {
-            let conn = match resolve(pos.get(1), mode) {
-                Ok(c) => c,
-                Err(e) => return finish(Err(e), opts),
-            };
-            let path = pos.get(2).map(|s| s.as_str()).unwrap_or("");
-            finish(do_run(&conn, path, opts), opts)
+            if pos.get(1).is_none() {
+                return finish(
+                    Err(CliError::usage("usage: q-cli run <conn> <path.q>|-")),
+                    opts,
+                );
+            }
+            if let Some(extra) = pos.get(3) {
+                return finish(
+                    Err(CliError::usage(&format!(
+                        "unexpected extra argument '{extra}' for 'run'"
+                    ))),
+                    opts,
+                );
+            }
+            let path = pos.get(2).map(String::as_str).unwrap_or("");
+            if path.is_empty() {
+                return finish(
+                    Err(CliError::usage("usage: q-cli run <conn> <path.q>|-")),
+                    opts,
+                );
+            }
+            if path != "-" {
+                let r = prepare_run(path, opts).and_then(|(content, stmts)| {
+                    let conn = resolve(pos.get(1).map(String::as_str), mode)?;
+                    do_run(&conn, &content, &stmts, opts)
+                });
+                finish(r, opts)
+            } else {
+                let r = resolve(pos.get(1).map(String::as_str), mode).and_then(|conn| {
+                    let (content, stmts) = prepare_run(path, opts)?;
+                    do_run(&conn, &content, &stmts, opts)
+                });
+                finish(r, opts)
+            }
         }
         // <conn> [arg] — build a q expression, optionally guard, eval, render.
         Spec::Eval { build, guard } => {
-            let conn = match resolve(pos.get(1), mode) {
-                Ok(c) => c,
-                Err(e) => return finish(Err(e), opts),
-            };
-            let arg = pos.get(2).cloned().unwrap_or_default();
-            let r = build(&arg).and_then(|expr| {
-                if *guard {
-                    ro(&expr, opts)?;
-                }
-                do_eval(&conn, &expr, opts)
-            });
-            finish(r, opts)
+            if pos.get(1).is_none() {
+                return finish(
+                    Err(CliError::usage(&format!("usage: q-cli {mode} <conn> ..."))),
+                    opts,
+                );
+            }
+            if let Some(extra) = pos.get(3) {
+                return finish(
+                    Err(CliError::usage(&format!(
+                        "unexpected extra argument '{extra}' for '{mode}' \
+                         (quote the q expression as a single argument)"
+                    ))),
+                    opts,
+                );
+            }
+            let arg = pos.get(2).map(String::as_str).unwrap_or("");
+            let accepts_stdin = matches!(mode, "query" | "time");
+            if arg != "-" || !accepts_stdin {
+                // Validate inline arg/readonly before resolving <conn> so bad syntax or
+                // missing args report usage errors even when no server config exists.
+                let r = prepare_eval(arg, *build, *guard, accepts_stdin, opts).and_then(
+                    |(expr, guard_raw, stmts)| {
+                        let conn = resolve(pos.get(1).map(String::as_str), mode)?;
+                        do_eval(&conn, &expr, guard_raw.as_deref(), &stmts, opts)
+                    },
+                );
+                finish(r, opts)
+            } else {
+                // When reading from stdin (`-`), resolve <conn> first so an invalid
+                // server profile fails immediately instead of blocking on stdin.
+                let r = resolve(pos.get(1).map(String::as_str), mode).and_then(|conn| {
+                    let (expr, guard_raw, stmts) =
+                        prepare_eval(arg, *build, *guard, accepts_stdin, opts)?;
+                    do_eval(&conn, &expr, guard_raw.as_deref(), &stmts, opts)
+                });
+                finish(r, opts)
+            }
         }
     }
 }
 
 /// Resolve the `<conn>` positional (a config name or `host:port`) into a
 /// connection string, or a usage error naming the command if it's missing.
-fn resolve(tok: Option<&String>, mode: &str) -> Result<String, E> {
-    let tok = tok.ok_or_else(|| E::usage(format!("usage: q-cli {} <conn> ...", mode)))?;
-    config::resolve_conn(tok).map_err(E::usage)
+fn resolve(tok: Option<&str>, mode: &str) -> Result<String, CliError> {
+    let tok = tok.ok_or_else(|| CliError::usage(&format!("usage: q-cli {mode} <conn> ...")))?;
+    config::resolve_conn(tok).map_err(|e| CliError::usage(&e))
 }
 
 // --- Eval builders that need more than a one-line closure --------------------
 
 /// Read all of stdin as the q source — the `-` argument for query/run/time, so
 /// generated or multi-line expressions can be piped in instead of quoted inline.
-fn slurp_stdin() -> R {
-    use std::io::Read;
+fn slurp_stdin() -> CmdResult {
     let mut s = String::new();
     std::io::stdin()
         .read_to_string(&mut s)
-        .map_err(|e| E::usage(format!("cannot read stdin: {}", e)))?;
+        .map_err(|e| CliError::usage(&format!("cannot read stdin: {e}")))?;
     Ok(s)
 }
 
-fn build_query(e: &str) -> R {
-    if e == "-" {
-        slurp_stdin()
+fn no_extra_arg(arg: &str, mode: &str) -> Result<(), CliError> {
+    if arg.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::usage(&format!(
+            "unexpected argument '{arg}' for '{mode}'"
+        )))
+    }
+}
+
+fn build_query(e: &str) -> CmdResult {
+    if e.trim().is_empty() {
+        Err(CliError::usage("usage: q-cli query <conn> <expr>|-"))
     } else {
         Ok(e.to_string())
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+fn prepare_eval(
+    arg: &str,
+    build: fn(&str) -> CmdResult,
+    guard: bool,
+    accepts_stdin: bool,
+    opts: &Opts,
+) -> Result<(String, Option<String>, Vec<QStatement>), CliError> {
+    if guard {
+        let raw = if accepts_stdin && arg == "-" {
+            slurp_stdin()?
+        } else {
+            arg.to_string()
+        };
+        if accepts_stdin {
+            if raw.trim().is_empty() {
+                build(&raw)?;
+            }
+            let stmts = split_q_script(&raw)?;
+            if stmts.is_empty() {
+                return Err(CliError::usage(
+                    "expression contains no executable statements (only comments or whitespace)",
+                ));
+            }
+            if opts.readonly {
+                for s in &stmts {
+                    check_readonly(&s.text, opts)?;
+                }
+            }
+            let joined = join_stmts_for_block(&stmts);
+            let effective_raw = if opts.scoped {
+                format!("{{[]\n{joined}\n}}[]")
+            } else {
+                joined
+            };
+            let expr = build(&effective_raw)?;
+            Ok((expr, Some(raw), stmts))
+        } else {
+            let expr = build(&raw)?;
+            check_readonly(&expr, opts)?;
+            let stmts = split_q_script(&expr)?;
+            Ok((expr, None, stmts))
+        }
+    } else {
+        let expr = build(arg)?;
+        Ok((expr, None, Vec::new()))
+    }
+}
+
+fn prepare_run(path: &str, opts: &Opts) -> Result<(String, Vec<QStatement>), CliError> {
+    let content = if path == "-" {
+        slurp_stdin()?
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| CliError::usage(&format!("cannot read file '{path}': {e}")))?
+    };
+
+    let stmts = split_q_script(&content)?;
+    if opts.readonly {
+        for s in &stmts {
+            check_readonly(&s.text, opts)?;
+        }
+    }
+    Ok((content, stmts))
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct QStatement {
     pub line_no: usize, // 1-indexed
     pub text: String,
@@ -204,21 +495,27 @@ pub struct QStatement {
 /// - Single-line comments start with `/` at column 0 or preceded by whitespace.
 /// - Block comments start with `/` alone on a line and end with `\` alone on a line.
 /// - A lone `\` at column 0 stops processing (EOF marker in q scripts).
+/// - All comments (block, line, and inline comments outside strings) are stripped from
+///   the returned statement text so IPC `value` evaluation never has subsequent lines
+///   or closing delimiters swallowed by a `/` comment.
 /// - Delimiter mismatches or unclosed strings return a syntax error before any
 ///   statement is executed, preventing partial script application.
-pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
+pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, CliError> {
     let mut stmts = Vec::new();
-    let mut current_stmt: Option<(usize, Vec<&str>)> = None;
+    let mut current_stmt: Option<(usize, Vec<String>)> = None;
     let mut in_block_comment = false;
     let mut in_str = false;
     let mut str_start_line = None;
     let mut delimiter_stack: Vec<(char, usize)> = Vec::new();
 
-    let finish_stmt = |cur: &mut Option<(usize, Vec<&str>)>, stmts: &mut Vec<QStatement>| {
+    let finish_stmt = |cur: &mut Option<(usize, Vec<String>)>, stmts: &mut Vec<QStatement>| {
         if let Some((line_no, lines)) = cur.take() {
             let joined = lines.join("\n").trim().to_string();
             if !joined.is_empty() {
-                stmts.push(QStatement { line_no, text: joined });
+                stmts.push(QStatement {
+                    line_no,
+                    text: joined,
+                });
             }
         }
     };
@@ -236,65 +533,50 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
 
         let at_top_level = !in_str && delimiter_stack.is_empty();
 
-        if at_top_level {
-            // A slash alone on a line starts a multi-line comment block
+        if !in_str {
+            // A slash alone at column 0 starts a multi-line comment block
             if trimmed == "/" {
                 in_block_comment = true;
-                finish_stmt(&mut current_stmt, &mut stmts);
                 continue;
             }
-
-            // A backslash alone on a line ends script execution (q EOF)
-            if trimmed == "\\" {
+            // A backslash alone at column 0 ends script execution (q EOF)
+            if at_top_level && trimmed == "\\" {
                 finish_stmt(&mut current_stmt, &mut stmts);
                 break;
             }
-
+            // Line comment at column 0
             if line.starts_with('/') {
-                finish_stmt(&mut current_stmt, &mut stmts);
                 continue;
             }
-
             if trimmed.trim().is_empty() {
-                finish_stmt(&mut current_stmt, &mut stmts);
                 continue;
             }
         }
 
         let first_char = line.chars().next();
-        let is_indented = first_char.map(|c| c == ' ' || c == '\t').unwrap_or(false);
+        let is_indented = first_char.is_some_and(|c| c == ' ' || c == '\t');
         let was_in_str = in_str;
-        let line_to_push = if was_in_str { line } else { trimmed };
 
-        if at_top_level && !is_indented {
-            finish_stmt(&mut current_stmt, &mut stmts);
-            current_stmt = Some((line_no, vec![line_to_push]));
-        } else if let Some((_, ref mut lines)) = current_stmt {
-            lines.push(line_to_push);
-        } else if !trimmed.trim().is_empty() && !line.starts_with('/') {
-            current_stmt = Some((line_no, vec![line_to_push]));
-        }
-
-        // Scan characters in line to update delimiter stack and string literal status
+        // Scan characters in line to update delimiter stack, string status,
+        // and strip inline comments.
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
         let mut prev_ws = true;
+        let mut comment_pos = None;
         while i < chars.len() {
             let c = chars[i];
             if in_str {
                 if c == '\\' {
                     i += 2; // skip escaped character (e.g. \" or \\)
                     continue;
-                } else if c == '"' {
+                }
+                if c == '"' {
                     in_str = false;
                     str_start_line = None;
                     prev_ws = false;
-                    i += 1;
-                    continue;
-                } else {
-                    i += 1;
-                    continue;
                 }
+                i += 1;
+                continue;
             }
 
             if c == '"' {
@@ -306,12 +588,9 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
             }
 
             // Inline comment: whitespace followed by '/' (excluding adverb '/:')
-            if prev_ws && c == '/' {
-                if i + 1 < chars.len() && chars[i + 1] == ':' {
-                    // Adverb /: (each-right), not a comment
-                } else {
-                    break; // rest of the line is a comment
-                }
+            if is_inline_comment(&chars, i, prev_ws) {
+                comment_pos = Some(i);
+                break;
             }
 
             match c {
@@ -319,45 +598,42 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
                 '}' => match delimiter_stack.pop() {
                     Some(('{', _)) => {}
                     Some((top, start)) => {
-                        return Err(E::usage(format!(
-                            "syntax error: mismatched closing '}}' on line {}, expected closing for '{}' opened on line {}",
-                            line_no, top, start
+                        return Err(CliError::usage(&format!(
+                            "syntax error: mismatched closing '}}' on line {line_no}, \
+                             expected closing for '{top}' opened on line {start}"
                         )));
                     }
                     None => {
-                        return Err(E::usage(format!(
-                            "syntax error: unexpected closing '}}' on line {}",
-                            line_no
+                        return Err(CliError::usage(&format!(
+                            "syntax error: unexpected closing '}}' on line {line_no}"
                         )));
                     }
                 },
                 ')' => match delimiter_stack.pop() {
                     Some(('(', _)) => {}
                     Some((top, start)) => {
-                        return Err(E::usage(format!(
-                            "syntax error: mismatched closing ')' on line {}, expected closing for '{}' opened on line {}",
-                            line_no, top, start
+                        return Err(CliError::usage(&format!(
+                            "syntax error: mismatched closing ')' on line {line_no}, \
+                             expected closing for '{top}' opened on line {start}"
                         )));
                     }
                     None => {
-                        return Err(E::usage(format!(
-                            "syntax error: unexpected closing ')' on line {}",
-                            line_no
+                        return Err(CliError::usage(&format!(
+                            "syntax error: unexpected closing ')' on line {line_no}"
                         )));
                     }
                 },
                 ']' => match delimiter_stack.pop() {
                     Some(('[', _)) => {}
                     Some((top, start)) => {
-                        return Err(E::usage(format!(
-                            "syntax error: mismatched closing ']' on line {}, expected closing for '{}' opened on line {}",
-                            line_no, top, start
+                        return Err(CliError::usage(&format!(
+                            "syntax error: mismatched closing ']' on line {line_no}, \
+                             expected closing for '{top}' opened on line {start}"
                         )));
                     }
                     None => {
-                        return Err(E::usage(format!(
-                            "syntax error: unexpected closing ']' on line {}",
-                            line_no
+                        return Err(CliError::usage(&format!(
+                            "syntax error: unexpected closing ']' on line {line_no}"
                         )));
                     }
                 },
@@ -368,39 +644,49 @@ pub fn split_q_script(src: &str) -> Result<Vec<QStatement>, E> {
             i += 1;
         }
 
-        // If string literal is still open at end of line, preserve trailing whitespace on opening line
-        if in_str && !was_in_str {
-            if let Some((_, ref mut lines)) = current_stmt {
-                if let Some(last) = lines.last_mut() {
-                    *last = line;
-                }
-            }
+        let cleaned_line = if let Some(pos) = comment_pos {
+            let without_comment: String = chars[..pos].iter().collect();
+            without_comment.trim_end().to_string()
+        } else if in_str || was_in_str {
+            line.to_string()
+        } else {
+            trimmed.to_string()
+        };
+
+        if !in_str && !was_in_str && cleaned_line.trim().is_empty() {
+            continue;
+        }
+
+        if at_top_level && !is_indented {
+            finish_stmt(&mut current_stmt, &mut stmts);
+            current_stmt = Some((line_no, vec![cleaned_line]));
+        } else if let Some((_, ref mut lines)) = current_stmt {
+            lines.push(cleaned_line);
+        } else {
+            current_stmt = Some((line_no, vec![cleaned_line]));
         }
     }
     finish_stmt(&mut current_stmt, &mut stmts);
 
     if let Some(start_line) = str_start_line {
-        return Err(E::usage(format!(
-            "syntax error: unclosed string literal starting at line {}",
-            start_line
+        return Err(CliError::usage(&format!(
+            "syntax error: unclosed string literal starting at line {start_line}"
         )));
     }
     if let Some(&(ch, start_line)) = delimiter_stack.last() {
-        return Err(E::usage(format!(
-            "syntax error: unclosed '{}' starting at line {}",
-            ch, start_line
+        return Err(CliError::usage(&format!(
+            "syntax error: unclosed '{ch}' starting at line {start_line}"
         )));
     }
 
     Ok(stmts)
 }
 
-fn build_time(expr: &str) -> R {
-    let expr = if expr == "-" { slurp_stdin()? } else { expr.to_string() };
-    if expr.is_empty() {
-        Err(E::usage("usage: q-cli time <conn> <expr>"))
+fn build_time(expr: &str) -> CmdResult {
+    if expr.trim().is_empty() {
+        Err(CliError::usage("usage: q-cli time <conn> <expr>|-"))
     } else {
-        Ok(query::time_q(&expr))
+        Ok(query::time_q(expr))
     }
 }
 
@@ -408,36 +694,38 @@ fn build_time(expr: &str) -> R {
 
 /// `web <off|get-ok|status>` — tune the q process' built-in HTTP handlers
 /// (.z.ph GET / .z.pp POST) at runtime.
-fn web_expr(action: &str) -> R {
+fn web_expr(action: &str) -> CmdResult {
     Ok(match action {
-        "off" => ".z.ph:{hclose .z.w};.z.pp:{hclose .z.w};\"web: off (all HTTP closed)\"".to_string(),
-        "get-ok" => {
-            ".z.ph:{.h.hy[`txt;\"OK\"]};.z.pp:{hclose .z.w};\"web: get-ok (GET 200, POST closed)\"".to_string()
+        "off" => {
+            ".z.ph:{hclose .z.w};.z.pp:{hclose .z.w};\"web: off (all HTTP closed)\"".to_string()
         }
-        "status" => {
-            "`ph`pp!(@[{string value x};`.z.ph;\"(default)\"];@[{string value x};`.z.pp;\"(none)\"])".to_string()
-        }
-        _ => return Err(E::usage("web action must be: off | get-ok | status")),
+        "get-ok" => ".z.ph:{.h.hy[`txt;\"OK\"]};.z.pp:{hclose .z.w};\
+                     \"web: get-ok (GET 200, POST closed)\""
+            .to_string(),
+        "status" => "`ph`pp!(@[{string value x};`.z.ph;\"(default)\"];\
+                     @[{string value x};`.z.pp;\"(none)\"])"
+            .to_string(),
+        _ => return Err(CliError::usage("web action must be: off | get-ok | status")),
     })
 }
 
 /// `trace <on|off|status>` — wrap .z.pg/.z.ps with .Q.trp so query errors return
 /// a .Q.sbt backtrace (and print it to the server console).
-fn trace_expr(action: &str) -> R {
+fn trace_expr(action: &str) -> CmdResult {
     const H: &str = "{.Q.trp[value;x;{-2 .Q.sbt y;'x,\"\\n\",.Q.sbt y}]}";
     Ok(match action {
         "on" => format!(".z.pg:{H};.z.ps:{H};\"trace: on\""),
         "off" => ".z.pg:value;.z.ps:value;\"trace: off\"".to_string(),
-        "status" => {
-            "`pg`ps!(@[{string value x};`.z.pg;\"(default)\"];@[{string value x};`.z.ps;\"(default)\"])".to_string()
-        }
-        _ => return Err(E::usage("trace action must be: on | off | status")),
+        "status" => "`pg`ps!(@[{string value x};`.z.pg;\"(default)\"];\
+                     @[{string value x};`.z.ps;\"(default)\"])"
+            .to_string(),
+        _ => return Err(CliError::usage("trace action must be: on | off | status")),
     })
 }
 
 // --- Execution + output ------------------------------------------------------
 
-fn do_ping(conn: &str, opts: &Opts) -> R {
+fn do_ping(conn: &str, opts: &Opts) -> CmdResult {
     let mut c = Conn::open(conn, opts.timeout)?;
     let _ = c.sync("1+1")?;
     Ok("pong".to_string())
@@ -445,59 +733,54 @@ fn do_ping(conn: &str, opts: &Opts) -> R {
 
 fn is_builtin_or_keyword(name: &str) -> bool {
     const BUILTINS: &[&str] = &[
-        "select", "exec", "update", "delete", "from", "by", "where",
-        "count", "meta", "tables", "views", "cols", "keys", "key", "value",
-        "first", "last", "sum", "avg", "min", "max", "prd", "med", "dev", "var",
-        "null", "not", "and", "or", "all", "any", "distinct", "group", "in", "like",
-        "bin", "binr", "asof", "lj", "uj", "ij", "pj", "aj", "aj0", "wj", "wj1",
-        "xbar", "xprev", "prev", "next", "prior", "mavg", "msum", "mcount",
-        "mdev", "mmin", "mmax", "ema", "deltas", "ratios", "differ",
-        "fills", "floor", "ceil", "abs", "sqrt", "exp", "log", "sin", "cos", "tan",
-        "asc", "desc", "xasc", "xdesc", "iasc", "idesc", "rank",
-        "string", "type", "upper", "lower", "trim", "ltrim", "rtrim",
-        "sv", "vs", "ss", "ssr", "raze", "enlist", "flip",
+        "select", "exec", "update", "delete", "from", "by", "where", "count", "meta", "tables",
+        "views", "cols", "keys", "key", "value", "first", "last", "sum", "avg", "min", "max",
+        "prd", "med", "dev", "var", "null", "not", "and", "or", "all", "any", "distinct", "group",
+        "in", "like", "bin", "binr", "asof", "lj", "uj", "ij", "pj", "aj", "aj0", "wj", "wj1",
+        "xbar", "xprev", "prev", "next", "prior", "mavg", "msum", "mcount", "mdev", "mmin", "mmax",
+        "ema", "deltas", "ratios", "differ", "fills", "floor", "ceil", "abs", "sqrt", "exp", "log",
+        "sin", "cos", "tan", "asc", "desc", "xasc", "xdesc", "iasc", "idesc", "rank", "string",
+        "type", "upper", "lower", "trim", "ltrim", "rtrim", "sv", "vs", "ss", "ssr", "raze",
+        "enlist", "flip", "i", "mod", "div", "cross", "cut", "md5", "except", "inter", "union",
     ];
     BUILTINS.contains(&name.to_lowercase().as_str())
 }
 
 fn extract_candidate_func_names(expr: &str) -> Vec<String> {
     let clean = strip_q_code(expr);
-    let tokens = tokenize_q_for_ro(&clean);
+    let tokens = tokenize_for_readonly(&clean);
     let mut names = Vec::new();
-    let mut prev_is_from = false;
 
     for (i, tok) in tokens.iter().enumerate() {
         if let QTok::Ident(name) = tok {
             let next = tokens.get(i + 1);
             let is_assign = matches!(
                 next,
-                Some(QTok::Colon) | Some(QTok::DoubleColon) | Some(QTok::CompoundColon(_))
+                Some(QTok::Colon | QTok::DoubleColon | QTok::CompoundColon(_))
             );
-            let is_call = match next {
-                Some(QTok::OpenBracket) | Some(QTok::OpenParen) => true,
-                // Prefix function call: f x, f 10, f `trade, f {x+1}
-                Some(QTok::Ident(n)) => !prev_is_from && !is_builtin_or_keyword(n),
-                Some(QTok::Other) | Some(QTok::OpenBrace) => !prev_is_from,
-                _ => false,
-            };
-            if !is_assign && is_call && !is_builtin_or_keyword(name) && !names.contains(name) {
+            if !is_assign
+                && is_valid_q_ident(name)
+                && !is_builtin_or_keyword(name)
+                && !names.contains(name)
+            {
                 names.push(name.clone());
             }
         }
-        prev_is_from = matches!(tok, QTok::From);
     }
     names
 }
 
-fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result<(), E> {
+fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result<(), CliError> {
     let names = extract_candidate_func_names(expr);
     if names.is_empty() {
         return Ok(());
     }
-    let syms = names.iter().map(|n| format!("`{}", n)).collect::<Vec<_>>().join("");
+    let syms: String = names.iter().map(|n| format!("`{n}")).collect();
     let probe = format!(
         "{{[syms; max_d]\n\
-           denied:`delete`update`insert`upsert`set`hdel`hopen`hclose`system`exit`dpft`dpfts`rename`value`get`eval`save`load`rsave`rload`dsave;\n\
+           denied:`delete`update`insert`upsert`set`hdel`hopen`hclose`system`exit\
+                  `dpft`dpfts`dsftg`chk`view`gc`rename`value`get`eval`save`load\
+                  `rsave`rload`dsave`reval`parse`hsym`hdpf`xf;\n\
            visited:()!();\n\
            violator:\"\";\n\
            queue:distinct (),syms;\n\
@@ -509,215 +792,256 @@ fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result
              if[not curr in key visited;\n\
                visited[curr]:1;\n\
                v:@[value; curr; ::];\n\
-               if[100h ~ type v;\n\
-                 src:lower string v;\n\
-                 if[any {{x like \"*\",string[y],\"*\"}}[src;] each denied; violator:string curr];\n\
-                 if[any {{x like \"*\",y,\"*\"}}[src;] each (\"0:\";\"1:\";\"2:\"); violator:string curr];\n\
-                 sub:distinct raze @[{{value[x] 3}}; v; `symbol$()];\n\
-                 sub:sub where {{100h ~ type @[value; x; ::]}} each sub;\n\
-                 queue:distinct queue,sub where not sub in key visited;\n\
+               t:type v;\n\
+               if[(t >= 100h) and t <= 112h;\n\
+                 s1:@[.Q.s1; v; \"\"];\n\
+                 raw:ssr[ssr[ssr[s1; \"(::)\"; \" \"]; \"[::\"; \"[\"]; \";::\"; \";\"];\n\
+                 if[raw like \"*.z.w*\"; violator:string curr];\n\
+                 src:lower raw;\n\
+                 globals:$[t = 100h; \
+                    @[{{g:value[x] 3; $[11h = type g; distinct g; `symbol$()]}}; v; `symbol$()]; \
+                    `symbol$()];\n\
+                 if[any globals in denied; violator:string curr];\n\
+                 clean_src:@[src; where not src in .Q.an,\"_\"; :; \" \"];\n\
+                 toks:(`$\" \" vs clean_src) except enlist `;\n\
+                 if[any toks in denied; violator:string curr];\n\
+                 if[any {{x like \"*\",y,\"*\"}}[src;] each \
+                    (\"0:\";\"1:\";\"2:\";\"3:\";\"::\";\"@[[]\";\".[[]\";\"![[]\";\"`:\";\
+                     \".z.ps\";\".z.pg\";\".z.ph\";\".z.pp\";\".z.po\";\".z.pc\"); \
+                    violator:string curr];\n\
+                 cands:distinct globals,toks;\n\
+                 sub:$[count cands; cands where \
+                    {{t:type @[value; x; ::]; (t >= 100h) and t <= 112h}} each cands; \
+                    `symbol$()];\n\
+                 queue:distinct queue,sub except key visited;\n\
                ];\n\
              ];\n\
              steps+:1;\n\
            ];\n\
            violator\n\
-         }}[{}; {}]",
-        syms, max_depth
+         }}[{syms}; {max_depth}]"
     );
-    match conn.sync(&probe) {
-        Ok(K::CharV(violator)) if !violator.is_empty() => {
-            Err(E::usage(format!(
-                "readonly: blocked server function '{}' (mutating operation detected in call chain); unset --readonly / Q_CLI_READONLY to allow",
-                violator
-            )))
-        }
+    match conn.sync(&probe)? {
+        K::CharV(violator) if !violator.is_empty() => Err(CliError::usage(&format!(
+            "readonly: blocked server function '{violator}' \
+             (mutating operation detected in call chain); \
+             unset --readonly / Q_CLI_READONLY to allow"
+        ))),
         _ => Ok(()),
     }
 }
 
-fn render_output(k: &K, opts: &Opts) -> R {
+fn render_output(k: &K, opts: &Opts) -> String {
     if matches!(opts.out, OutMode::Text | OutMode::Json) && opts.max_rows > 0 {
         if let Some(total) = render::table_rows(k) {
             if total > opts.max_rows {
-                eprintln!(
-                    "note: showing {} of {} rows (--max-rows {})",
-                    opts.max_rows, total, opts.max_rows
-                );
+                let max = opts.max_rows;
+                eprintln!("note: showing {max} of {total} rows (--max-rows {max})");
             }
         }
     }
 
-    Ok(match opts.out {
+    match opts.out {
         OutMode::Json => render::to_json(k, opts.max_rows),
         OutMode::Csv => render::to_csv(k),
         OutMode::Text | OutMode::Console => render::to_text(k, opts.max_rows),
-    })
+    }
 }
 
 fn prepare_stmt_for_block(stmt: &str) -> String {
-    let t = stmt.trim();
-    if t.starts_with('\\') {
-        let cmd = t[1..].trim();
-        format!("system \"{}\"", q_escape(cmd))
+    let t = stmt.trim().trim_end_matches(';').trim_end();
+    if let Some(rest) = t.strip_prefix('\\') {
+        let cmd = rest.trim();
+        let escaped = query::q_escape(cmd);
+        format!("system \"{escaped}\"")
     } else {
-        stmt.to_string()
+        t.to_string()
     }
 }
 
-fn do_eval(conn: &str, expr: &str, opts: &Opts) -> R {
+#[inline]
+fn is_inline_comment(chars: &[char], i: usize, prev_ws: bool) -> bool {
+    prev_ws && chars[i] == '/' && chars.get(i + 1) != Some(&':')
+}
+
+fn join_stmts_for_block(stmts: &[QStatement]) -> String {
+    let prepared_list: Vec<String> = stmts
+        .iter()
+        .map(|s| prepare_stmt_for_block(&s.text))
+        .filter(|s| !s.is_empty())
+        .collect();
+    prepared_list.join(";\n")
+}
+
+fn validate_dry_run(
+    conn: &mut Conn,
+    stmts: &[QStatement],
+    with_line_no: bool,
+) -> Result<(), CliError> {
+    for s in stmts {
+        let prepared = prepare_stmt_for_block(&s.text);
+        let escaped = query::q_escape(&prepared);
+        let probe = format!("@[parse; \"{escaped}\"; {{'x}}]");
+        if let Err(e) = conn.sync(&probe) {
+            let line_no = s.line_no;
+            let msg = if with_line_no {
+                format!("dry-run failed on line {line_no}: {}", e.msg)
+            } else {
+                format!("dry-run failed: {}", e.msg)
+            };
+            return Err(CliError { kind: e.kind, msg });
+        }
+    }
+    Ok(())
+}
+
+fn do_eval(
+    conn: &str,
+    expr: &str,
+    guard_raw: Option<&str>,
+    stmts: &[QStatement],
+    opts: &Opts,
+) -> CmdResult {
     let mut c = Conn::open(conn, opts.timeout)?;
     if opts.readonly {
-        inspect_remote_funcs(&mut c, expr, 5)?;
+        if let Some(raw) = guard_raw {
+            inspect_remote_funcs(&mut c, raw, 5)?;
+        }
     }
-    let expr_scoped = if opts.scoped {
-        format!("{{[]\n{}\n}}[]", prepare_stmt_for_block(expr))
+    if opts.dry_run {
+        validate_dry_run(&mut c, stmts, false)?;
+        return Ok(
+            "dry-run: passed (expression validated on server with parse, zero mutations)"
+                .to_string(),
+        );
+    }
+    // --console: let q render the result string (.Q.s) for max fidelity.
+    let to_send = if opts.out == OutMode::Console {
+        let escaped = query::q_escape(expr);
+        format!(".Q.s value \"{escaped}\"")
     } else {
         expr.to_string()
     };
-    // --console: let q render the result string (.Q.s) for max fidelity.
-    let to_send = if opts.out == OutMode::Console {
-        format!(".Q.s value \"{}\"", q_escape(&expr_scoped))
-    } else {
-        expr_scoped
-    };
     let k = c.sync(&to_send)?;
-    render_output(&k, opts)
+    Ok(render_output(&k, opts))
 }
 
-fn do_run(conn: &str, path: &str, opts: &Opts) -> R {
-    let content = if path == "-" {
-        slurp_stdin()?
-    } else if path.is_empty() {
-        return Err(E::usage("usage: q-cli run <conn> <path.q>|-"));
-    } else {
-        std::fs::read_to_string(path)
-            .map_err(|e| E::usage(format!("cannot read file '{}': {}", path, e)))?
-    };
-
-    let stmts = split_q_script(&content)?;
-    if stmts.is_empty() {
-        return Ok(String::new());
-    }
-
-    if opts.readonly {
-        for s in &stmts {
-            ro(&s.text, opts)?;
-        }
-    }
-
+fn do_run(conn: &str, content: &str, stmts: &[QStatement], opts: &Opts) -> CmdResult {
     let mut c = Conn::open(conn, opts.timeout)?;
 
     if opts.readonly {
-        inspect_remote_funcs(&mut c, &content, 5)?;
+        inspect_remote_funcs(&mut c, content, 5)?;
     }
-
-    let joined_stmts = stmts
-        .iter()
-        .map(|s| prepare_stmt_for_block(&s.text))
-        .collect::<Vec<_>>()
-        .join(";\n");
 
     // Dry-run mode: Validate syntax on the server using q `parse` with zero side effects.
     // Even if the script contains mutating operations (insert, delete, set, ::),
     // `parse` parses and checks syntax without executing any statements against the database.
     if opts.dry_run {
-        for s in &stmts {
-            let prepared = prepare_stmt_for_block(&s.text);
-            let probe = format!("@[parse; \"{}\"; {{'x}}]", q_escape(&prepared));
-            if let Err(e) = c.sync(&probe) {
-                return Err(E::query(format!("dry-run failed on line {}: {}", s.line_no, e.msg)));
-            }
-        }
+        validate_dry_run(&mut c, stmts, true)?;
+        let count = stmts.len();
         return Ok(format!(
-            "dry-run: passed ({} statements validated on server with parse, zero mutations)",
-            stmts.len()
+            "dry-run: passed ({count} statements validated on server with parse, zero mutations)"
         ));
     }
 
-    // Atomic mode: Send the entire script as a single protected IPC evaluation
-    if opts.atomic {
+    if stmts.is_empty() {
+        return Ok(render_output(&K::Null, opts));
+    }
+
+    // Atomic or Scoped mode: Send the entire script in a single block so local variables
+    // declared in earlier statements remain in scope across the script.
+    if opts.atomic || opts.scoped {
+        let joined_stmts = join_stmts_for_block(stmts);
         let body = if opts.scoped {
-            format!("{{[]\n{}\n}}[]", joined_stmts)
+            format!("{{[]\n{joined_stmts}\n}}[]")
         } else {
             joined_stmts
         };
-        let to_send = if opts.out == OutMode::Console {
-            format!(".Q.s @[value; \"{}\"; {{'x}}]", q_escape(&body))
+        let to_send = if opts.atomic {
+            let escaped = query::q_escape(&body);
+            if opts.out == OutMode::Console {
+                format!(".Q.s @[value; \"{escaped}\"; {{'x}}]")
+            } else {
+                format!("@[value; \"{escaped}\"; {{'x}}]")
+            }
+        } else if opts.out == OutMode::Console {
+            let escaped = query::q_escape(&body);
+            format!(".Q.s value \"{escaped}\"")
         } else {
-            format!("@[value; \"{}\"; {{'x}}]", q_escape(&body))
+            body
         };
         let last_k = c.sync(&to_send)?;
-        return render_output(&last_k, opts);
+        return Ok(render_output(&last_k, opts));
     }
 
     // Sequential mode (default): Execute statement by statement with line-level failure reporting
     let mut last_k = K::Null;
     for (idx, s) in stmts.iter().enumerate() {
         let is_last = idx + 1 == stmts.len();
-        let prepared = prepare_stmt_for_block(&s.text);
-        let to_send = if opts.scoped {
-            format!("{{[]\n{}\n}}[]", prepared)
-        } else {
-            prepared
-        };
+        let console_wrapper;
         let to_send = if is_last && opts.out == OutMode::Console {
-            format!(".Q.s value \"{}\"", q_escape(&to_send))
+            let prepared = prepare_stmt_for_block(&s.text);
+            let escaped = query::q_escape(&prepared);
+            console_wrapper = format!(".Q.s value \"{escaped}\"");
+            console_wrapper.as_str()
         } else {
-            to_send
+            s.text.as_str()
         };
-        match c.sync(&to_send) {
+        match c.sync(to_send) {
             Ok(k) => {
                 last_k = k;
             }
             Err(e) => {
-                return Err(E::query(format!("line {}: {}", s.line_no, e.msg)));
+                let line_no = s.line_no;
+                let msg = e.msg;
+                return Err(CliError {
+                    kind: e.kind,
+                    msg: format!("line {line_no}: {msg}"),
+                });
             }
         }
     }
 
-    render_output(&last_k, opts)
+    Ok(render_output(&last_k, opts))
 }
 
 /// Resolve a conn token and run a fixed (q-cli-generated) expression on it.
-fn run_on(conn_tok: Option<&String>, expr: &str, opts: &Opts) -> i32 {
-    let tok = match conn_tok {
-        Some(c) => c,
-        None => {
-            return finish(
-                Err(E::usage("missing <conn> (e.g. localhost:5000 or @server)")),
-                opts,
-            )
-        }
+fn run_on(conn_tok: Option<&str>, expr: &str, opts: &Opts) -> i32 {
+    let Some(tok) = conn_tok else {
+        return finish(
+            Err(CliError::usage(
+                "missing <conn> (e.g. localhost:5000 or @server)",
+            )),
+            opts,
+        );
     };
     let r = config::resolve_conn(tok)
-        .map_err(E::usage)
-        .and_then(|conn| do_eval(&conn, expr, opts));
+        .map_err(|e| CliError::usage(&e))
+        .and_then(|conn| do_eval(&conn, expr, None, &[], opts));
     finish(r, opts)
 }
 
 /// Print a result or a structured error, return the process exit code.
-pub fn finish(result: R, opts: &Opts) -> i32 {
+#[must_use]
+pub fn finish(result: CmdResult, opts: &Opts) -> i32 {
     match result {
         Ok(s) => {
-            use std::io::Write;
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
-            if let Err(e) = writeln!(handle, "{}", s) {
+            if let Err(e) = writeln!(handle, "{s}") {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     return 0;
                 }
-                eprintln!("ERR failed writing to stdout: {}", e);
+                eprintln!("ERR failed writing to stdout: {e}");
                 return 1;
             }
             0
         }
         Err(e) => {
             if opts.out == OutMode::Json {
-                eprintln!(
-                    "{{\"error\":{},\"kind\":\"{}\"}}",
-                    render::json_string(&e.msg),
-                    e.kind.name()
-                );
+                let err_json = render::json_string(&e.msg);
+                let kind_name = e.kind.name();
+                eprintln!("{{\"error\":{err_json},\"kind\":\"{kind_name}\"}}");
             } else {
                 eprintln!("ERR {}", e.msg);
             }
@@ -728,13 +1052,15 @@ pub fn finish(result: R, opts: &Opts) -> i32 {
 
 /// Strip both string contents and comments (line comments, inline comments, block comments)
 /// from a q expression so the readonly scan inspects code syntax without false positives.
+#[must_use]
 pub fn strip_q_code(expr: &str) -> String {
     let mut out = String::with_capacity(expr.len());
     let mut in_str = false;
     let mut in_block_comment = false;
+    let mut delim_depth: usize = 0;
 
     for line in expr.lines() {
-        let trimmed = line.trim();
+        let trimmed = line.trim_end();
         if in_block_comment {
             if trimmed == "\\" {
                 in_block_comment = false;
@@ -748,7 +1074,7 @@ pub fn strip_q_code(expr: &str) -> String {
                 out.push('\n');
                 continue;
             }
-            if trimmed == "\\" {
+            if delim_depth == 0 && trimmed == "\\" {
                 break;
             }
             if line.starts_with('/') {
@@ -766,16 +1092,14 @@ pub fn strip_q_code(expr: &str) -> String {
                 if c == '\\' {
                     i += 2;
                     continue;
-                } else if c == '"' {
+                }
+                if c == '"' {
                     in_str = false;
                     out.push('"');
                     prev_ws = false;
-                    i += 1;
-                    continue;
-                } else {
-                    i += 1;
-                    continue;
                 }
+                i += 1;
+                continue;
             }
 
             if c == '"' {
@@ -786,12 +1110,14 @@ pub fn strip_q_code(expr: &str) -> String {
                 continue;
             }
 
-            if prev_ws && c == '/' {
-                if i + 1 < chars.len() && chars[i + 1] == ':' {
-                    // Adverb /: (each-right), not a comment
-                } else {
-                    break;
-                }
+            if is_inline_comment(&chars, i, prev_ws) {
+                break;
+            }
+
+            match c {
+                '{' | '(' | '[' => delim_depth += 1,
+                '}' | ')' | ']' => delim_depth = delim_depth.saturating_sub(1),
+                _ => {}
             }
 
             out.push(c);
@@ -803,9 +1129,12 @@ pub fn strip_q_code(expr: &str) -> String {
     out
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum QTok {
     Ident(String),
+    Symbol,
+    StringLit,
+    NumberLit,
     Colon,
     DoubleColon,
     CompoundColon(char),
@@ -822,7 +1151,7 @@ enum QTok {
     Other,
 }
 
-fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
+fn tokenize_for_readonly(src: &str) -> Vec<QTok> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
@@ -830,6 +1159,43 @@ fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
         let c = chars[i];
         if c.is_whitespace() {
             i += 1;
+            continue;
+        }
+
+        if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
+            }
+            if i < chars.len() {
+                i += 1;
+            }
+            tokens.push(QTok::StringLit);
+            continue;
+        }
+
+        if c == '`' {
+            i += 1;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric()
+                    || matches!(chars[i], '_' | '.' | ':' | '`'))
+            {
+                i += 1;
+            }
+            tokens.push(QTok::Symbol);
+            continue;
+        }
+
+        if c.is_ascii_digit()
+            || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
+        {
+            i += 1;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | ':'))
+            {
+                i += 1;
+            }
+            tokens.push(QTok::NumberLit);
             continue;
         }
 
@@ -844,28 +1210,63 @@ fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
             continue;
         }
 
-        if matches!(c, ',' | '+' | '-' | '*' | '%' | '&' | '|' | '^' | '_' | '#' | '!') {
-            if i + 1 < chars.len() && chars[i + 1] == ':' {
-                tokens.push(QTok::CompoundColon(c));
-                i += 2;
-                continue;
-            }
+        if matches!(
+            c,
+            ',' | '+' | '-' | '*' | '%' | '&' | '|' | '^' | '_' | '#' | '!'
+        ) && i + 1 < chars.len()
+            && chars[i + 1] == ':'
+        {
+            tokens.push(QTok::CompoundColon(c));
+            i += 2;
+            continue;
         }
 
         match c {
-            '(' => { tokens.push(QTok::OpenParen); i += 1; continue; }
-            ')' => { tokens.push(QTok::CloseParen); i += 1; continue; }
-            '[' => { tokens.push(QTok::OpenBracket); i += 1; continue; }
-            ']' => { tokens.push(QTok::CloseBracket); i += 1; continue; }
-            '{' => { tokens.push(QTok::OpenBrace); i += 1; continue; }
-            '}' => { tokens.push(QTok::CloseBrace); i += 1; continue; }
-            ';' => { tokens.push(QTok::Semi); i += 1; continue; }
+            '(' => {
+                tokens.push(QTok::OpenParen);
+                i += 1;
+                continue;
+            }
+            ')' => {
+                tokens.push(QTok::CloseParen);
+                i += 1;
+                continue;
+            }
+            '[' => {
+                tokens.push(QTok::OpenBracket);
+                i += 1;
+                continue;
+            }
+            ']' => {
+                tokens.push(QTok::CloseBracket);
+                i += 1;
+                continue;
+            }
+            '{' => {
+                tokens.push(QTok::OpenBrace);
+                i += 1;
+                continue;
+            }
+            '}' => {
+                tokens.push(QTok::CloseBrace);
+                i += 1;
+                continue;
+            }
+            ';' => {
+                tokens.push(QTok::Semi);
+                i += 1;
+                continue;
+            }
             _ => {}
         }
 
-        if c.is_ascii_alphabetic() || c == '.' {
+        if c.is_ascii_alphabetic()
+            || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic()))
+        {
             let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+            {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
@@ -887,74 +1288,204 @@ fn tokenize_q_for_ro(src: &str) -> Vec<QTok> {
 
 /// Readonly guard: in readonly mode, reject arbitrary q that looks mutating.
 /// This blocks:
-/// - File & dynamic library I/O (0:, 1:, 2:)
-/// - System backslash commands (\)
+/// - File & dynamic library I/O (0:, 1:, 2:, 3:)
+/// - System backslash commands (\) and k)/q) language mode switches
 /// - Mutating keywords (delete, update, insert, upsert, set, value, get, eval, save, load, etc.)
-/// - Amends (@[, .[)
+/// - Amends (@[, .[, ![) and @ / . / ! used as higher-order values or with adverbs
+/// - Dynamic symbol casting (`$"...") and IPC handle string execution (h "...")
 /// - System/handler namespace mutations (.z., .ps.)
 /// - Global assignments (ident::) and compound assignments (ident,:, ident+:, etc.)
 /// - Variable assignments (ident:) outside of select/exec column projections
-fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
+fn check_readonly(expr: &str, opts: &Opts) -> Result<(), CliError> {
     if !opts.readonly {
         return Ok(());
     }
 
     let clean = strip_q_code(expr);
 
-    // Reject system backslash commands (e.g. \rm, \cd, \p, etc.) across statements or lines
-    for stmt in clean.split(|c| c == ';' || c == '\n' || c == '\r') {
+    // Reject system backslash commands (\rm, \cd, \p, etc.) and k)/q) language mode switches
+    for stmt in clean.split([';', '\n', '\r']) {
         let t = stmt.trim();
         if t.starts_with('\\') {
-            return Err(E::usage(
-                "readonly: blocked system command ('\\'); unset --readonly / Q_CLI_READONLY to allow"
-                    .to_string(),
+            return Err(CliError::usage(
+                "readonly: blocked system command ('\\'); \
+                 unset --readonly / Q_CLI_READONLY to allow",
+            ));
+        }
+        let tl = t.to_lowercase();
+        if tl.starts_with("k)") || tl.starts_with("q)") {
+            return Err(CliError::usage(
+                "readonly: blocked language mode prefix ('k)' / 'q)'); \
+                 unset --readonly / Q_CLI_READONLY to allow",
             ));
         }
     }
 
     let lower = clean.to_lowercase();
-    for op in ["0:", "1:", "2:"] {
+    if lower.contains("`:") {
+        return Err(CliError::usage(
+            "readonly: blocked file/IPC handle symbol ('`:'); \
+             unset --readonly / Q_CLI_READONLY to allow",
+        ));
+    }
+    for op in ["0:", "1:", "2:", "3:"] {
         if lower.contains(op) {
-            return Err(E::usage(format!(
-                "readonly: blocked '{}' (file/dynamic I/O); unset --readonly / Q_CLI_READONLY to allow",
-                op
+            return Err(CliError::usage(&format!(
+                "readonly: blocked '{op}' (file/dynamic/IPC I/O); \
+                 unset --readonly / Q_CLI_READONLY to allow"
             )));
         }
+    }
+    for sys_var in [".z.ps", ".z.pg", ".z.ph", ".z.pp", ".z.po", ".z.pc", ".q.trp"] {
+        if lower.contains(sys_var) {
+            return Err(CliError::usage(&format!(
+                "readonly: blocked '{sys_var}'; unset --readonly / Q_CLI_READONLY to allow"
+            )));
+        }
+    }
+    // Block .z.w (lowercase only, avoiding false positive on read-only .z.W open handles)
+    if clean.contains(".z.w") {
+        return Err(CliError::usage(
+            "readonly: blocked '.z.w'; unset --readonly / Q_CLI_READONLY to allow",
+        ));
     }
 
     const DENIED: &[&str] = &[
-        "delete", "update", "insert", "upsert", "set", "hdel", "hopen", "hclose", "system",
-        "exit", "dpft", "dpfts", "rename", "value", "get", "eval", "save", "load", "rsave",
-        "rload", "dsave",
+        "delete", "update", "insert", "upsert", "set", "hdel", "hopen", "hclose", "system", "exit",
+        "dpft", "dpfts", "dsftg", "chk", "view", "gc", "rename", "value", "get", "eval", "save",
+        "load", "rsave", "rload", "dsave", "reval", "parse", "hsym", "hdpf", "xf",
     ];
-    for tok in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        if DENIED.contains(&tok) {
-            return Err(E::usage(format!(
-                "readonly: blocked '{}'; unset --readonly / Q_CLI_READONLY to allow",
-                tok
-            )));
+    let lower_bytes = lower.as_bytes();
+    let mut idx = 0;
+    while idx < lower_bytes.len() {
+        let b = lower_bytes[idx];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            let start = idx;
+            while idx < lower_bytes.len()
+                && (lower_bytes[idx].is_ascii_alphanumeric() || lower_bytes[idx] == b'_')
+            {
+                idx += 1;
+            }
+            let tok = &lower[start..idx];
+            if DENIED.contains(&tok) {
+                let is_safe_sym_literal = is_comparison_sym_literal(lower_bytes, start, idx);
+                if !is_safe_sym_literal {
+                    return Err(CliError::usage(&format!(
+                        "readonly: blocked '{tok}'; unset --readonly / Q_CLI_READONLY to allow"
+                    )));
+                }
+            }
+        } else {
+            idx += 1;
         }
     }
 
-    // Amend @[...] or .[...] with optional whitespace before bracket
+    // Check character-level patterns:
+    // - Dynamic symbol cast from string (`$..., "s"$..., "S"$..., 11h$..., -11h$...)
+    // - Amend @[...] / .[...] / ![...], adverbial !/ ./ @/, or higher-order @ / . / ! values
     let chars: Vec<char> = clean.chars().collect();
     for i in 0..chars.len() {
-        if chars[i] == '@' || chars[i] == '.' {
+        // Block dynamic symbol casts (e.g. `$"del", "s"$"del", (-11h)$"del", (`)$"del")
+        if chars[i] == '$' {
+            let mut k = i;
+            while k > 0 && chars[k - 1].is_ascii_whitespace() {
+                k -= 1;
+            }
+            if k > 0 {
+                let prev_c = chars[k - 1];
+                let is_sym_target = prev_c == '`'
+                    || prev_c == '"'
+                    || prev_c == ')'
+                    || prev_c == ']'
+                    || (prev_c.is_ascii_alphanumeric() && {
+                        let mut w_start = k - 1;
+                        while w_start > 0 && chars[w_start - 1].is_ascii_alphanumeric() {
+                            w_start -= 1;
+                        }
+                        let word: String = chars[w_start..k].iter().collect();
+                        let wl = word.to_lowercase();
+                        wl == "symbol" || wl == "s" || wl == "11h" || wl == "-11h"
+                    });
+                if is_sym_target {
+                    let mut after = i + 1;
+                    while after < chars.len() && chars[after].is_ascii_whitespace() {
+                        after += 1;
+                    }
+                    let is_empty_cast = after + 1 < chars.len()
+                        && chars[after] == '('
+                        && chars[after + 1] == ')';
+                    if !is_empty_cast {
+                        return Err(CliError::usage(
+                            "readonly: blocked dynamic symbol cast ('$'); \
+                             unset --readonly / Q_CLI_READONLY to allow",
+                        ));
+                    }
+                }
+            }
+        }
+
+        if matches!(chars[i], '@' | '.' | '!') {
+            // If '.' is part of a qualified identifier (.ns.x) or decimal (1.5), skip it
+            if chars[i] == '.' {
+                let prev_alnum = i > 0
+                    && (chars[i - 1].is_ascii_alphanumeric()
+                        || chars[i - 1] == '_'
+                        || chars[i - 1] == '`');
+                let next_alnum = i + 1 < chars.len()
+                    && (chars[i + 1].is_ascii_alphanumeric() || chars[i + 1] == '_');
+                if prev_alnum || next_alnum {
+                    continue;
+                }
+                // Allow root namespace symbol `.` when passed to tables, views, key, count
+                let mut before = i;
+                while before > 0
+                    && (chars[before - 1].is_ascii_whitespace() || chars[before - 1] == '[')
+                {
+                    before -= 1;
+                }
+                let mut w_start = before;
+                while w_start > 0
+                    && (chars[w_start - 1].is_ascii_alphabetic()
+                        || chars[w_start - 1] == '_')
+                {
+                    w_start -= 1;
+                }
+                let prev_word: String = chars[w_start..before].iter().collect();
+                if matches!(
+                    prev_word.to_lowercase().as_str(),
+                    "tables" | "views" | "key" | "count" | "system"
+                ) {
+                    continue;
+                }
+            }
             let mut j = i + 1;
-            while j < chars.len() && chars[j].is_whitespace() {
+            while j < chars.len() && (chars[j].is_whitespace() || chars[j] == ')') {
                 j += 1;
             }
             if j < chars.len() && chars[j] == '[' {
-                return Err(E::usage(
-                    "readonly: blocked amend ('@[' / '.['); unset --readonly / Q_CLI_READONLY to allow"
-                        .to_string(),
+                return Err(CliError::usage(
+                    "readonly: blocked amend ('@[' / '.[' / '!['); \
+                     unset --readonly / Q_CLI_READONLY to allow",
                 ));
+            }
+            // Block adverbs on @ / . / ! (e.g., !/, ./, @', !/:) or using @ / . / ! as a value
+            // before `;`, `)`, `]`, `}`, `,` or end of expression
+            if j >= chars.len()
+                || matches!(chars[j], ';' | ')' | ']' | '}' | ',' | '/' | '\\' | '\'')
+            {
+                return Err(CliError::usage(&format!(
+                    "readonly: blocked operator '{}' used as value or with adverb; \
+                     unset --readonly / Q_CLI_READONLY to allow",
+                    chars[i]
+                )));
             }
         }
     }
 
-    // Validate assignments: ident::, ident,:, and ident: (outside select/exec projection and outside lambda local scopes)
-    let tokens = tokenize_q_for_ro(&clean);
+    // Validate assignments and IPC handle calls:
+    // - ident::, ident,:, and ident: (outside select/exec projection and lambda local scopes)
+    // - handle "query" or handle["query"]
+    let tokens = tokenize_for_readonly(&clean);
     let mut scope_stack: Vec<bool> = Vec::new();
     let mut in_projection = false;
     let mut brace_depth: usize = 0;
@@ -962,15 +1493,52 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
 
     for tok in &tokens {
         match tok {
+            QTok::Ident(name) => {
+                if matches!(prev_token, Some(QTok::NumberLit))
+                    && !is_builtin_or_keyword(name)
+                {
+                    return Err(CliError::usage(
+                        "readonly: blocked potential IPC handle invocation; \
+                         unset --readonly / Q_CLI_READONLY to allow",
+                    ));
+                }
+            }
             QTok::Select | QTok::Exec => {
                 in_projection = true;
             }
             QTok::From => {
                 in_projection = false;
             }
+            QTok::StringLit => {
+                if let Some(prev) = prev_token {
+                    let prev_is_safe_str_op = match prev {
+                        QTok::Ident(w) => {
+                            matches!(
+                                w.to_lowercase().as_str(),
+                                "like" | "ss" | "ssr" | "vs" | "sv" | "enlist" | "raze"
+                                    | "count" | "first" | "last" | "reverse" | "upper"
+                                    | "lower" | "trim" | "ltrim" | "rtrim" | "string"
+                                    | "type" | "null" | "distinct" | "group" | "in" | "within"
+                                    | "except" | "inter" | "union" | "cross" | "asc" | "desc"
+                                    | "iasc" | "idesc" | "md5" | "cut"
+                            )
+                        }
+                        _ => false,
+                    };
+                    if matches!(prev, QTok::NumberLit | QTok::CloseParen | QTok::CloseBrace)
+                        || (matches!(prev, QTok::Ident(_)) && !prev_is_safe_str_op)
+                    {
+                        return Err(CliError::usage(
+                            "readonly: blocked potential IPC handle or dynamic string call; \
+                             unset --readonly / Q_CLI_READONLY to allow",
+                        ));
+                    }
+                }
+            }
             QTok::OpenBrace => {
                 brace_depth += 1;
                 scope_stack.push(in_projection);
+                in_projection = false;
             }
             QTok::CloseBrace => {
                 brace_depth = brace_depth.saturating_sub(1);
@@ -978,8 +1546,27 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
                     in_projection = prev;
                 }
             }
-            QTok::OpenParen | QTok::OpenBracket => {
+            QTok::OpenBracket => {
+                // Check if preceded by a NumberLit (e.g. 0["query"])
+                if matches!(prev_token, Some(QTok::NumberLit)) {
+                    return Err(CliError::usage(
+                        "readonly: blocked potential IPC handle invocation; \
+                         unset --readonly / Q_CLI_READONLY to allow",
+                    ));
+                }
                 scope_stack.push(in_projection);
+                in_projection = false;
+            }
+            QTok::OpenParen => {
+                // Check if preceded by a NumberLit (e.g. 0("query"))
+                if matches!(prev_token, Some(QTok::NumberLit)) {
+                    return Err(CliError::usage(
+                        "readonly: blocked potential IPC handle invocation; \
+                         unset --readonly / Q_CLI_READONLY to allow",
+                    ));
+                }
+                scope_stack.push(in_projection);
+                in_projection = false;
             }
             QTok::CloseParen | QTok::CloseBracket => {
                 if let Some(prev) = scope_stack.pop() {
@@ -992,29 +1579,56 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
                 }
             }
             QTok::DoubleColon => {
-                if let Some(QTok::Ident(name)) = prev_token {
-                    return Err(E::usage(format!(
-                        "readonly: blocked global assignment ('{}::'); unset --readonly / Q_CLI_READONLY to allow",
-                        name
-                    )));
+                match prev_token {
+                    Some(QTok::Ident(name)) => {
+                        return Err(CliError::usage(&format!(
+                            "readonly: blocked global assignment ('{name}::'); \
+                             unset --readonly / Q_CLI_READONLY to allow"
+                        )));
+                    }
+                    Some(QTok::CloseBracket | QTok::CloseParen) => {
+                        return Err(CliError::usage(
+                            "readonly: blocked global assignment ('::'); \
+                             unset --readonly / Q_CLI_READONLY to allow",
+                        ));
+                    }
+                    _ => {}
                 }
             }
             QTok::CompoundColon(op) => {
-                if let Some(QTok::Ident(name)) = prev_token {
-                    return Err(E::usage(format!(
-                        "readonly: blocked compound assignment ('{}{}:'); unset --readonly / Q_CLI_READONLY to allow",
-                        name, op
-                    )));
+                match prev_token {
+                    Some(QTok::Ident(name)) => {
+                        return Err(CliError::usage(&format!(
+                            "readonly: blocked compound assignment ('{name}{op}:'); \
+                             unset --readonly / Q_CLI_READONLY to allow"
+                        )));
+                    }
+                    Some(QTok::CloseBracket | QTok::CloseParen) => {
+                        return Err(CliError::usage(&format!(
+                            "readonly: blocked compound assignment ('{op}:'); \
+                             unset --readonly / Q_CLI_READONLY to allow"
+                        )));
+                    }
+                    _ => {}
                 }
             }
             QTok::Colon => {
-                if let Some(QTok::Ident(name)) = prev_token {
-                    if !in_projection && (brace_depth == 0 || name.contains('.')) {
-                        return Err(E::usage(format!(
-                            "readonly: blocked assignment ('{}:'); unset --readonly / Q_CLI_READONLY to allow",
-                            name
+                match prev_token {
+                    Some(QTok::Ident(name))
+                        if name.contains('.') || (!in_projection && brace_depth == 0) =>
+                    {
+                        return Err(CliError::usage(&format!(
+                            "readonly: blocked assignment ('{name}:'); \
+                             unset --readonly / Q_CLI_READONLY to allow"
                         )));
                     }
+                    Some(QTok::CloseBracket | QTok::CloseParen) => {
+                        return Err(CliError::usage(
+                            "readonly: blocked indexed/destructured assignment (':'); \
+                             unset --readonly / Q_CLI_READONLY to allow",
+                        ));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1025,27 +1639,125 @@ fn ro(expr: &str, opts: &Opts) -> Result<(), E> {
     Ok(())
 }
 
+/// True if a `DENIED` word at `bytes[start..end]` is part of a symbol literal
+/// (`\`word` or `\`a\`word`) that immediately follows a read-only boolean comparison
+/// operator (`=`, `<>`, `~`, `in`, `within`) and is not followed by a function argument.
+fn is_comparison_sym_literal(bytes: &[u8], start: usize, end: usize) -> bool {
+    if start == 0 || bytes[start - 1] != b'`' {
+        return false;
+    }
+    // Walk back to the start of the symbol or symbol vector (`a`b`c)
+    let mut sym_start = start - 1;
+    while sym_start > 0 {
+        let mut p = sym_start;
+        while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'_') {
+            p -= 1;
+        }
+        if p > 0 && bytes[p - 1] == b'`' {
+            sym_start = p - 1;
+        } else {
+            break;
+        }
+    }
+    // Skip whitespace before the symbol vector
+    let mut before = sym_start;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before == 0 {
+        return false;
+    }
+    let preceded_by_cmp = if matches!(bytes[before - 1], b'=' | b'~')
+        || (before >= 2 && &bytes[before - 2..before] == b"<>")
+    {
+        true
+    } else if bytes[before - 1].is_ascii_alphabetic() {
+        let mut w_start = before - 1;
+        while w_start > 0 && bytes[w_start - 1].is_ascii_alphabetic() {
+            w_start -= 1;
+        }
+        let prev_word = &bytes[w_start..before];
+        matches!(prev_word, b"in" | b"within")
+    } else {
+        false
+    };
+    if !preceded_by_cmp {
+        return false;
+    }
+
+    // Walk forward to the end of the symbol vector (`a`b`c)
+    let mut sym_end = end;
+    while sym_end < bytes.len() && bytes[sym_end] == b'`' {
+        sym_end += 1;
+        while sym_end < bytes.len()
+            && (bytes[sym_end].is_ascii_alphanumeric() || bytes[sym_end] == b'_')
+        {
+            sym_end += 1;
+        }
+    }
+    while sym_end < bytes.len() && bytes[sym_end].is_ascii_whitespace() {
+        sym_end += 1;
+    }
+    // After a comparison symbol literal, only end-of-input, `;`, `,`, `)`, `]`, `}`, or
+    // query clauses (`from`, `by`, `where`, `and`, `or`) are safe.
+    if sym_end >= bytes.len() || matches!(bytes[sym_end], b';' | b',' | b')' | b']' | b'}') {
+        return true;
+    }
+    if bytes[sym_end].is_ascii_alphabetic() {
+        let w_start = sym_end;
+        let mut w_end = sym_end;
+        while w_end < bytes.len() && bytes[w_end].is_ascii_alphabetic() {
+            w_end += 1;
+        }
+        return matches!(
+            &bytes[w_start..w_end],
+            b"from" | b"by" | b"where" | b"and" | b"or"
+        );
+    }
+    false
+}
+
+/// True if `ident` is a valid q identifier or dot-qualified identifier
+/// (e.g. `trade`, `t_1`, `.ns.trade`). Rejects empty segments like `..` or `trade.`.
+fn is_valid_q_ident(ident: &str) -> bool {
+    let body = ident.strip_prefix('.').unwrap_or(ident);
+    if body.is_empty() {
+        return false;
+    }
+    body.split('.').all(|seg| {
+        let mut chars = seg.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
 /// Validate a table argument is a plain q identifier (optionally namespaced)
 /// before it's interpolated into a q expression, so a stray name like `foo bar`
 /// gives a clean usage error (exit 2) instead of a confusing q parse error.
-fn need_table(t: &str) -> Result<&str, E> {
+fn need_table(t: &str) -> Result<&str, CliError> {
     if t.is_empty() {
-        return Err(E::usage("this command needs a table name"));
+        return Err(CliError::usage("this command needs a table name"));
     }
-    let first_ok = t
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '.');
-    let rest_ok = t
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
-    let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
-    if first_ok && rest_ok && has_alpha {
+    if is_valid_q_ident(t) {
         Ok(t)
     } else {
-        Err(E::usage(format!(
-            "invalid table name '{}' (expected a q identifier, e.g. trade or .ns.trade)",
-            t
+        Err(CliError::usage(&format!(
+            "invalid table name '{t}' (expected a q identifier, e.g. trade or .ns.trade)"
+        )))
+    }
+}
+
+/// Validate an optional namespace argument (`""` / `"."` for root, or `.ns` / `ns`)
+/// before interpolating it into `functions_q`.
+fn need_namespace(ns: &str) -> Result<&str, CliError> {
+    if ns.is_empty() || ns == "." {
+        return Ok("");
+    }
+    if is_valid_q_ident(ns) {
+        Ok(ns)
+    } else {
+        Err(CliError::usage(&format!(
+            "invalid namespace '{ns}' (expected a q namespace, e.g. .q, .Q, or my_ns)"
         )))
     }
 }
@@ -1054,12 +1766,10 @@ fn usage_string() -> String {
     let mut s = String::from("q-cli — native kdb+ IPC client\n\nUSAGE:\n");
     for c in CMDS {
         let out = matches!(c.spec, Spec::Eval { .. } | Spec::Run);
-        s.push_str(&format!(
-            "  q-cli {}{:<9} {}\n",
-            if out { "[OUT] " } else { "      " },
-            c.name,
-            c.help
-        ));
+        let prefix = if out { "[OUT] " } else { "      " };
+        let name = c.name;
+        let help = c.help;
+        let _ = writeln!(s, "  q-cli {prefix}{name:<9} {help}");
     }
     s.push_str(
         "\n\
@@ -1069,16 +1779,17 @@ fn usage_string() -> String {
          \x20   global  $Q_CLI_CONFIG or ~/.config/q-cli/servers.conf\n\
          \x20   project nearest .q-cli.conf up from CWD  (config --project writes ./.q-cli.conf)\n\
          \n\
-         OUT (default: aligned text, 50-row cap):\n\
+         OUT (default: aligned text, 50-row cap; or Q_CLI_OUT=text|json|csv|console):\n\
+         \x20 --text          aligned text table/value output (default)\n\
          \x20 --json, -j      JSON (tables -> array of row objects)\n\
          \x20 --csv           CSV (tables only; uncapped)\n\
          \x20 --console       let the q server format via .Q.s\n\
-         \x20 --max-rows N    row cap for text/json (0 = unlimited)\n\
+         \x20 --max-rows N    row cap for text/json (0 = unlimited; or Q_CLI_MAX_ROWS)\n\
          \x20 --timeout MS    query wait in ms (default 30000; or Q_CLI_TIMEOUT)\n\
          \x20 --readonly      reject mutating q (or set Q_CLI_READONLY=1)\n\
          \x20 --scoped        evaluate inside {[] ... }[] to isolate locals\n\
          \x20 --atomic        run .q script as a single atomic protected block\n\
-         \x20 --dry-run       simulate script in sandbox without mutating state\n\
+         \x20 --dry-run       validate syntax on server with parse (zero mutations)\n\
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
@@ -1097,15 +1808,10 @@ pub fn print_usage() {
 mod tests {
     use super::*;
 
-    fn ro_opts() -> Opts {
+    fn readonly_opts() -> Opts {
         Opts {
-            out: OutMode::Text,
-            max_rows: 0,
             readonly: true,
-            scoped: false,
-            atomic: false,
-            dry_run: false,
-            timeout: None,
+            ..Opts::default()
         }
     }
 
@@ -1120,28 +1826,60 @@ mod tests {
     fn prepare_stmt_for_block_converts_backslash() {
         assert_eq!(prepare_stmt_for_block("\\c 25 120"), "system \"c 25 120\"");
         assert_eq!(prepare_stmt_for_block("\\p 5000"), "system \"p 5000\"");
-        assert_eq!(prepare_stmt_for_block("select from t"), "select from t");
+        assert_eq!(prepare_stmt_for_block("select from t;"), "select from t");
     }
 
     #[test]
     fn readonly_blocks_mutating_code() {
-        assert!(ro("delete from t", &ro_opts()).is_err());
-        assert!(ro("`t insert (1;2)", &ro_opts()).is_err());
-        assert!(ro("save `:x set til 3", &ro_opts()).is_err());
-        assert!(ro("(`:f) 0: \"x\"", &ro_opts()).is_err()); // file I/O
+        assert!(check_readonly("delete from t", &readonly_opts()).is_err());
+        assert!(check_readonly("`t insert (1;2)", &readonly_opts()).is_err());
+        assert!(check_readonly("save `:x set til 3", &readonly_opts()).is_err());
+        assert!(check_readonly("(`:f) 0: \"x\"", &readonly_opts()).is_err()); // file I/O
     }
 
     #[test]
     fn readonly_allows_reads_and_string_literal_keywords() {
-        assert!(ro("select from t", &ro_opts()).is_ok());
+        assert!(check_readonly("select from t", &readonly_opts()).is_ok());
         // the keyword appears only inside a string literal -> not a mutation
-        assert!(ro("select from t where note like \"*delete*\"", &ro_opts()).is_ok());
+        assert!(
+            check_readonly("select from t where note like \"*delete*\"", &readonly_opts()).is_ok()
+        );
+        // symbol literals matching denied names are allowed in read queries
+        assert!(
+            check_readonly("select from log where action = `delete", &readonly_opts()).is_ok()
+        );
+        assert!(
+            check_readonly(
+                "select from log where action = `delete, sym = `AAPL",
+                &readonly_opts()
+            )
+            .is_ok()
+        );
+        assert!(
+            check_readonly(
+                "select from log where action in `insert`update",
+                &readonly_opts()
+            )
+            .is_ok()
+        );
+        // Calling a symbol as a function (bracket, prefix, or infix) or handle symbols is blocked
+        assert!(check_readonly("`insert[t; (1;2)]", &readonly_opts()).is_err());
+        assert!(check_readonly("`set (`t; 1)", &readonly_opts()).is_err());
+        assert!(check_readonly("`t `insert (1;2)", &readonly_opts()).is_err());
+        assert!(check_readonly("`::localhost:5000 \"1+1\"", &readonly_opts()).is_err());
+        assert!(check_readonly("(@)[`t;`a;:;1]", &readonly_opts()).is_err());
+        assert!(check_readonly("(.)[`t;();:;1]", &readonly_opts()).is_err());
+        assert!(check_readonly("{trade[0]: 1}[]", &readonly_opts()).is_err());
+        assert!(check_readonly("{(a;.ns.b): (1;2)}[]", &readonly_opts()).is_err());
     }
 
     #[test]
     fn readonly_off_allows_everything() {
-        let opts = Opts { readonly: false, ..ro_opts() };
-        assert!(ro("delete from t", &opts).is_ok());
+        let opts = Opts {
+            readonly: false,
+            ..readonly_opts()
+        };
+        assert!(check_readonly("delete from t", &opts).is_ok());
     }
 
     #[test]
@@ -1155,20 +1893,77 @@ mod tests {
         assert!(need_table(".").is_err()); // cannot be only dots
         assert!(need_table("..").is_err());
         assert!(need_table("._.").is_err());
+        assert!(need_table("..trade").is_err());
+        assert!(need_table("trade.").is_err());
+        assert!(need_table(".ns..trade").is_err());
+    }
+
+    #[test]
+    fn namespace_validation() {
+        assert_eq!(need_namespace("").unwrap(), "");
+        assert_eq!(need_namespace(".").unwrap(), "");
+        assert_eq!(need_namespace(".Q").unwrap(), ".Q");
+        assert_eq!(need_namespace("u").unwrap(), "u");
+        assert!(need_namespace("q; delete from trade").is_err());
+        assert!(need_namespace("..").is_err());
+        assert!(need_namespace("..ns").is_err());
+        assert!(need_namespace("ns.").is_err());
+        assert!(need_namespace("1ns").is_err());
+    }
+
+    #[test]
+    fn time_command_works_with_readonly_and_blocks_mutations() {
+        let (expr, guard_raw, stmts) =
+            prepare_eval("select from trade", build_time, true, true, &readonly_opts()).unwrap();
+        assert!(expr.contains(".z.p"));
+        assert_eq!(guard_raw.as_deref(), Some("select from trade"));
+        assert_eq!(stmts.len(), 1);
+
+        assert!(
+            prepare_eval("delete from trade", build_time, true, true, &readonly_opts()).is_err()
+        );
+        assert!(prepare_eval("   ", build_time, true, true, &readonly_opts()).is_err());
+        assert!(prepare_eval("/ only comment", build_query, true, true, &readonly_opts()).is_err());
+        assert!(prepare_eval("", build_query, true, true, &readonly_opts()).is_err());
+        assert!(prepare_eval("   ", build_query, true, true, &readonly_opts()).is_err());
+        assert!(
+            prepare_eval(
+                "",
+                |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
+                true,
+                false,
+                &readonly_opts()
+            )
+            .is_err()
+        );
+        // `gc -` must fail immediately as an unexpected argument, not read stdin
+        assert!(
+            prepare_eval(
+                "-",
+                |a| no_extra_arg(a, "gc").map(|()| ".Q.gc[]".to_string()),
+                true,
+                false,
+                &Opts::default()
+            )
+            .is_err()
+        );
+        assert!(no_extra_arg("extra", "tables").is_err());
+        assert!(check_readonly("(`:host:5000) 3: \"1+1\"", &readonly_opts()).is_err());
     }
 
     #[test]
     fn readonly_blocks_value_amend_and_namespaces() {
-        assert!(ro("value \"1+1\"", &ro_opts()).is_err());
-        assert!(ro("@[`t;`a;:;1]", &ro_opts()).is_err());
-        assert!(ro(".[t;(0;`a);:;1]", &ro_opts()).is_err());
-        assert!(ro(".z.pg:{x}", &ro_opts()).is_err());
-        assert!(ro(".ps.f:{x}", &ro_opts()).is_err());
+        assert!(check_readonly("value \"1+1\"", &readonly_opts()).is_err());
+        assert!(check_readonly("@[`t;`a;:;1]", &readonly_opts()).is_err());
+        assert!(check_readonly(".[t;(0;`a);:;1]", &readonly_opts()).is_err());
+        assert!(check_readonly("![`t;();0b;`symbol$()]", &readonly_opts()).is_err());
+        assert!(check_readonly(".z.pg:{x}", &readonly_opts()).is_err());
+        assert!(check_readonly(".ps.f:{x}", &readonly_opts()).is_err());
 
         // Harmless read-only .z. variables must be allowed
-        assert!(ro(".z.p", &ro_opts()).is_ok());
-        assert!(ro(".z.K", &ro_opts()).is_ok());
-        assert!(ro("select from t where date = .z.d", &ro_opts()).is_ok());
+        assert!(check_readonly(".z.p", &readonly_opts()).is_ok());
+        assert!(check_readonly(".z.K", &readonly_opts()).is_ok());
+        assert!(check_readonly("select from t where date = .z.d", &readonly_opts()).is_ok());
     }
 
     #[test]
@@ -1230,45 +2025,57 @@ ignored after eof
 
     #[test]
     fn readonly_blocks_assignments_and_system_commands() {
-        assert!(ro("t: 0#t", &ro_opts()).is_err());
-        assert!(ro("trade: 1", &ro_opts()).is_err());
-        assert!(ro("trade::1", &ro_opts()).is_err());
-        assert!(ro("t,: (1; 2)", &ro_opts()).is_err());
-        assert!(ro("t +: 1", &ro_opts()).is_err());
-        assert!(ro("t #: 10", &ro_opts()).is_err());
-        assert!(ro("d !: 1", &ro_opts()).is_err());
-        assert!(ro("trade: select from trade", &ro_opts()).is_err());
-        assert!(ro("\"lib.so\" 2: (\"f\"; 1)", &ro_opts()).is_err());
-        assert!(ro("\\rm -rf /", &ro_opts()).is_err());
-        assert!(ro("1+1; \\cd /", &ro_opts()).is_err());
-        assert!(ro("1+1\n\\rm -rf /", &ro_opts()).is_err());
-        assert!(ro("select from t\n\\p 5000", &ro_opts()).is_err());
-        assert!(ro("get \"delete from t\"", &ro_opts()).is_err());
-        assert!(ro("eval (insert; `t; 1)", &ro_opts()).is_err());
+        assert!(check_readonly("t: 0#t", &readonly_opts()).is_err());
+        assert!(check_readonly("trade: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("trade::1", &readonly_opts()).is_err());
+        assert!(check_readonly("t,: (1; 2)", &readonly_opts()).is_err());
+        assert!(check_readonly("t +: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("t #: 10", &readonly_opts()).is_err());
+        assert!(check_readonly("d !: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("trade: select from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("\"lib.so\" 2: (\"f\"; 1)", &readonly_opts()).is_err());
+        assert!(check_readonly("\\rm -rf /", &readonly_opts()).is_err());
+        assert!(check_readonly("1+1; \\cd /", &readonly_opts()).is_err());
+        assert!(check_readonly("1+1\n\\rm -rf /", &readonly_opts()).is_err());
+        assert!(check_readonly("select from t\n\\p 5000", &readonly_opts()).is_err());
+        assert!(check_readonly("get \"delete from t\"", &readonly_opts()).is_err());
+        assert!(check_readonly("eval (insert; `t; 1)", &readonly_opts()).is_err());
+        assert!(check_readonly("trade[0]: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("trade[0]:: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("trade[0] +: 1", &readonly_opts()).is_err());
+        assert!(check_readonly("(a;b): (1;2)", &readonly_opts()).is_err());
     }
 
     #[test]
     fn readonly_allows_select_aliases_comments_and_generic_null() {
-        assert!(ro("select c: count i, max_p: max price from trade", &ro_opts()).is_ok());
-        assert!(ro("exec p: last price from trade", &ro_opts()).is_ok());
-        assert!(ro("(::)", &ro_opts()).is_ok());
-        assert!(ro("f[::; 1]", &ro_opts()).is_ok());
+        assert!(
+            check_readonly(
+                "select c: count i, max_p: max price from trade",
+                &readonly_opts()
+            )
+            .is_ok()
+        );
+        assert!(check_readonly("exec p: last price from trade", &readonly_opts()).is_ok());
+        assert!(check_readonly("(::)", &readonly_opts()).is_ok());
+        assert!(check_readonly("f[::; 1]", &readonly_opts()).is_ok());
         // Comments containing denied keywords must not block
-        assert!(ro("select from trade / delete from trade", &ro_opts()).is_ok());
+        assert!(check_readonly("select from trade / delete from trade", &readonly_opts()).is_ok());
     }
 
     #[test]
     fn readonly_allows_lambda_local_variables_but_blocks_globals() {
         // Local variables inside { ... } should be allowed
-        assert!(ro("{tmp: 1; select from t where x > tmp}[]", &ro_opts()).is_ok());
-        assert!(ro("{[x] y: x + 1; y*2}[10]", &ro_opts()).is_ok());
-        assert!(ro("{trade: 0#trade}[]", &ro_opts()).is_ok()); // local assignment in lambda
+        assert!(
+            check_readonly("{tmp: 1; select from t where x > tmp}[]", &readonly_opts()).is_ok()
+        );
+        assert!(check_readonly("{[x] y: x + 1; y*2}[10]", &readonly_opts()).is_ok());
+        assert!(check_readonly("{trade: 0#trade}[]", &readonly_opts()).is_ok());
 
-        // But global assignment :: or namespaced assignment with . inside lambda must still be blocked
-        assert!(ro("{trade:: 0#trade}[]", &ro_opts()).is_err());
-        assert!(ro("{x::1}[]", &ro_opts()).is_err());
-        assert!(ro("{.t: 1}[]", &ro_opts()).is_err());
-        assert!(ro("{.ns.x: 1}[]", &ro_opts()).is_err());
+        // Global assignment :: or namespaced assignment with . inside lambda must still be blocked
+        assert!(check_readonly("{trade:: 0#trade}[]", &readonly_opts()).is_err());
+        assert!(check_readonly("{x::1}[]", &readonly_opts()).is_err());
+        assert!(check_readonly("{.t: 1}[]", &readonly_opts()).is_err());
+        assert!(check_readonly("{.ns.x: 1}[]", &readonly_opts()).is_err());
     }
 
     #[test]
@@ -1300,9 +2107,37 @@ ignored after eof
         assert_eq!(f2, vec![".ns.my_func"]);
 
         let f3 = extract_candidate_func_names("select count i by sym from trade");
-        assert!(f3.is_empty());
+        assert_eq!(f3, vec!["sym", "trade"]);
 
-        let f4 = extract_candidate_func_names("cleanup 10; .ns.clean `trade; my_func arg");
-        assert_eq!(f4, vec!["cleanup", ".ns.clean", "my_func"]);
+        let f4 = extract_candidate_func_names("cleanup 10; .ns.clean `trade; my_func arg; (f2)[1]");
+        assert_eq!(f4, vec!["cleanup", ".ns.clean", "my_func", "arg", "f2"]);
+    }
+
+    #[test]
+    fn readonly_blocks_advanced_bypasses() {
+        assert!(check_readonly("k).\"delete from trade\"", &readonly_opts()).is_err());
+        assert!(check_readonly("q)delete from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("`$\"delete\"", &readonly_opts()).is_err());
+        assert!(check_readonly("`symbol$\"set\"", &readonly_opts()).is_err());
+        assert!(check_readonly("0 \"delete from trade\"", &readonly_opts()).is_err());
+        assert!(check_readonly("h \"delete from trade\"", &readonly_opts()).is_err());
+        assert!(check_readonly("(`select; trade: 0#trade)", &readonly_opts()).is_err());
+        assert!(check_readonly("select (trade: 0#trade) from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("select trade[0]: 1 from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("select .z.pg: {x} from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("{f: !; f[`t; (); 0b; `symbol$()]}[]", &readonly_opts()).is_err());
+        assert!(check_readonly("{[f] f[`t; (); :; 1]}[.]", &readonly_opts()).is_err());
+        assert!(check_readonly("(@/) (`t; `a; :; 1)", &readonly_opts()).is_err());
+        assert!(check_readonly("(last (`a union `set))[`t; 1]", &readonly_opts()).is_err());
+        assert!(check_readonly("1;\n  /\n  delete from trade", &readonly_opts()).is_err());
+        assert!(check_readonly("{1;\n\\\ndelete from trade\n}[]", &readonly_opts()).is_err());
+    }
+
+    #[test]
+    fn split_q_script_strips_inline_and_interleaved_comments() {
+        let script = "select\n  sym, / symbol col\n/ price col\n  price\n  from trade";
+        let stmts = split_q_script(script).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0].text, "select\n  sym,\n  price\n  from trade");
     }
 }

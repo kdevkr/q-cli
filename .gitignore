@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Local server profiles
+.q-cli.conf
+
 # Editor / OS
 *.swp
 .DS_Store
