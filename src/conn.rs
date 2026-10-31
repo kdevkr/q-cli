@@ -142,9 +142,15 @@ impl Conn {
 
         #[cfg(feature = "tls")]
         let stream = if use_tls {
+            #[cfg(feature = "tls")]
+            static WARNED_TLS_NO_VERIFY: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+
             let mut builder = native_tls::TlsConnector::builder();
             if tls_no_verify {
-                eprintln!("warning: TLS certificate verification is disabled");
+                if !WARNED_TLS_NO_VERIFY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("warning: TLS certificate verification is disabled");
+                }
                 builder.danger_accept_invalid_certs(true);
                 builder.danger_accept_invalid_hostnames(true);
             }
@@ -262,17 +268,17 @@ impl Conn {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scheme {
+enum Scheme {
     Tcp,
     Tcps,
 }
 
 fn strip_scheme(conn: &str) -> (&str, Option<Scheme>, &str) {
-    if conn.len() >= 7 && conn[..7].eq_ignore_ascii_case("tcps://") {
+    if conn.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("tcps://")) {
         (&conn[7..], Some(Scheme::Tcps), &conn[..7])
-    } else if conn.len() >= 6 && conn[..6].eq_ignore_ascii_case("tls://") {
+    } else if conn.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("tls://")) {
         (&conn[6..], Some(Scheme::Tcps), &conn[..6])
-    } else if conn.len() >= 6 && conn[..6].eq_ignore_ascii_case("tcp://") {
+    } else if conn.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("tcp://")) {
         (&conn[6..], Some(Scheme::Tcp), &conn[..6])
     } else {
         (conn, None, "")
@@ -545,6 +551,32 @@ mod tests {
         assert_eq!(
             mask_err_conn("tls://[::1]:5001:user:pass"),
             "tls://[::1]:<masked>"
+        );
+    }
+
+    #[test]
+    fn parse_conn_non_ascii_unicode() {
+        let (host, port, creds) = parse_conn("서버서:5000").unwrap();
+        assert_eq!(host, "서버서");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+        assert!(!resolve_tls("서버서:5000", false));
+        assert!(resolve_tls("서버서:5000", true));
+
+        let (host, port, creds) = parse_conn("tcps://한글호스트:5001:사용자:비번").unwrap();
+        assert_eq!(host, "한글호스트");
+        assert_eq!(port, 5001);
+        assert_eq!(creds, "사용자:비번");
+        assert!(resolve_tls("tcps://한글호스트:5001:사용자:비번", false));
+        assert!(!resolve_tls("tcp://한글호스트:5001", true));
+
+        assert_eq!(
+            mask_err_conn("tcps://한글호스트:5001:사용자:비번"),
+            "tcps://한글호스트:<masked>"
+        );
+        assert_eq!(
+            mask_err_conn("서버서:5000:유저:패스워드"),
+            "서버서:<masked>"
         );
     }
 

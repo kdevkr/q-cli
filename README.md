@@ -219,6 +219,10 @@ cp target/release/q-cli.exe ~/.local/bin/    # (Windows: Copy-Item ... )
 Requires the Rust GNU toolchain on Windows (`stable-x86_64-pc-windows-gnu`) — no
 MSVC build tools needed.
 
+On Linux, building with `--features tls` requires OpenSSL development headers
+(`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora/RHEL). Windows (Schannel)
+and macOS (Security.framework) use OS-native TLS and do not require external packages.
+
 Or install straight from git:
 ```sh
 cargo install --git https://github.com/kdevkr/q-cli

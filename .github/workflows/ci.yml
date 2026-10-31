@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Run tests (default)
+        run: cargo test
+      - name: Run tests (tls)
+        run: cargo test --features tls
+      - name: Clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (tls)
+        run: cargo clippy --all-targets --features tls -- -D warnings
