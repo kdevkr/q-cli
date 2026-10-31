@@ -1,245 +1,105 @@
 # q-cli
 
-A native **kdb+/q IPC client** in Rust. Connects to a running q process over TCP,
-speaking the kdb+ wire protocol directly — no `q.exe`, no license.
+A native **kdb+/q IPC client** in Rust. Connects to a running q process over TCP or TLS,
+speaking the kdb+ wire protocol directly — no `q.exe` or license required.
 Single self-contained binary, cross-platform.
 
-## Usage
-```
-q-cli [OUT] query  <conn> "<q expression>"   # or `-` to read the expr from stdin
-q-cli [OUT] run    <conn> <path.q>           # or `-` to read q source from stdin
-q-cli [OUT] tables <conn>
-q-cli [OUT] views  <conn>
-q-cli [OUT] meta   <conn> <table>
-q-cli [OUT] count  <conn> <table>
-q-cli [OUT] describe <conn> <table>  # partitioning + schema + rows + sample (1 call)
-q-cli [OUT] schema <conn>            # all tables: rows/cols/partition (1 call)
-q-cli [OUT] functions <conn> [ns]    # defined functions + arity (root or .ns)
-q-cli [OUT] info   <conn>            # version, pid, port, memory, handles
-q-cli [OUT] time   <conn> "<q expr>" # elapsed ms + result row count (or `-` for stdin)
-q-cli       gc     <conn>            # .Q.gc[] -> bytes returned to the OS
-q-cli       ping   <conn>
-q-cli       web    <off|get-ok|status> <conn>   # tune built-in HTTP serving
-q-cli       trace  <on|off|status> <conn>       # .Q.trp backtraces on errors
-q-cli       config <init|path|list|add> [--project]
-```
+## Quick Start
 
 ```sh
-# first-time setup — scaffold ~/.config/q-cli/servers.conf, then edit it
-q-cli config init
-q-cli config add prod bigbox:5001:user:pass     # add/update an entry
-q-cli config list                               # show servers (passwords masked)
+# Basic query & table listing
+q-cli ping localhost:5000
+q-cli query localhost:5000 'select avg price by sym from trade'
+q-cli tables localhost:5000
 
-q-cli --version                                 # print the version and exit
-q-cli ping  localhost:5555
-q-cli query localhost:5555 'select avg price by sym from trade'
-cat report.q | q-cli query @ -                  # pipe a generated/multi-line expr
-q-cli --json query @prod 'select sym,price from trade'    # array of row objects
-q-cli --csv  query @prod 'select from trade' > trade.csv  # export (uncapped)
-q-cli --console query @ 'flip 0!exec sym from trade'      # q renders it (.Q.s)
-q-cli tables @          # list tables on the default server
-q-cli meta  @ trade     # column schema
+# JSON or CSV output
+q-cli --json query @prod 'select from trade'
+q-cli --csv  query @prod 'select from trade' > trade.csv
+
+# Server profiles (~/.config/q-cli/servers.conf)
+q-cli config add prod bigbox:5001:alice:secret
+q-cli query @prod 'select count i from trade'
 ```
 
-**`<conn>`** — `host:port[:user:pass]`, or a config name (`@name` / `name` /
-`@`=default). Config is **two layers, project overriding global**:
-```text
-# global:  $Q_CLI_CONFIG, else ~/.config/q-cli/servers.conf
-# project: nearest .q-cli.conf walking up from the current directory
-default = local
-local   = localhost:5555
-prod    = bigbox:5001:user:pass
-```
-A per-project `.q-cli.conf` (e.g. checked into a repo) overlays the global one —
-same-named entries (including `default`) win. `$Q_CLI_CONFIG`, if set, is used
-alone. Manage either layer:
+> See [**`docs/examples.md`**](docs/examples.md) for advanced queries, script execution, piping, and tuning.
+
+## Commands
+
+| Command | Arguments | Description |
+|---|---|---|
+| `query` | `<conn> "<expr>"\|-` | Evaluate q expression (`-` for stdin) |
+| `run` | `<conn> <file.q>\|-` | Execute `.q` script file (`-` for stdin) |
+| `ping` | `<conn>` | Connection probe (`pong`) |
+| `tables` | `<conn>` | List all tables |
+| `views` | `<conn>` | List all views |
+| `meta` | `<conn> <table>` | Table column types and attributes |
+| `count` | `<conn> <table>` | Table row count |
+| `describe` | `<conn> <table>` | Comprehensive table profile in 1 round-trip |
+| `schema` | `<conn>` | Overview of all tables in 1 round-trip |
+| `functions` | `<conn> [ns]` | Defined functions with arities (root or `.ns`) |
+| `info` | `<conn>` | Server health snapshot (version, pid, port, memory) |
+| `time` | `<conn> "<expr>"\|-` | Measure query time (ms) and row count |
+| `gc` | `<conn>` | Trigger `.Q.gc[]` to free memory to OS |
+| `web` | `<off\|get-ok\|status> <conn>` | Configure built-in HTTP handling at runtime |
+| `trace` | `<on\|off\|status> <conn>` | Wrap handlers with `.Q.trp` for error call stacks |
+| `config` | `<init\|path\|list\|add> [--project]` | Manage server profiles |
+
+`<conn>` accepts `[scheme://]host:port[:user:pass]`, `@profile`, or `@` (default server).
+
+## Options & Flags
+
+| Flag | Env Var | Description |
+|---|---|---|
+| `--text` | `Q_CLI_OUT=text` | Aligned text output (default) |
+| `--json`, `-j` | `Q_CLI_OUT=json` | Output JSON array of row objects |
+| `--csv` | `Q_CLI_OUT=csv` | RFC 4180 CSV output (tables only; uncapped) |
+| `--console` | `Q_CLI_OUT=console` | Format with server-side `.Q.s` (max fidelity) |
+| `--max-rows N` | `Q_CLI_MAX_ROWS=N` | Row limit for text/json (default `50`; `0` = unlimited) |
+| `--timeout MS` | `Q_CLI_TIMEOUT=MS` | Query timeout in ms (default `30000`; `0` = wait forever) |
+| `--readonly` | `Q_CLI_READONLY=1` | Reject mutating expressions (client-side safety guard) |
+| `--scoped` | - | Wrap execution in `{[] ... }[]` to isolate locals |
+| `--atomic` | - | Run `.q` script as a single protected IPC transaction |
+| `--dry-run` | - | Validate syntax with server-side `parse` without mutating |
+| `--tls` | `Q_CLI_TLS=1` | Connect over TLS/SSL (mitigates CWE-319) |
+| `--tls-no-verify`, `--insecure` | `Q_CLI_TLS_NO_VERIFY=1` | Skip TLS certificate verification (dev only) |
+
+> Details on `--readonly` mechanics, TLS policies, and server access control are documented in [**`docs/security.md`**](docs/security.md).
+
+## Exit Codes
+
+| Code | Meaning | Details |
+|:---:|---|---|
+| `0` | Success | Command completed successfully |
+| `2` | Usage / Policy | Bad arguments, unrecognized server, or `--readonly` block |
+| `3` | Connection Error | Unreachable host, authentication failure, handshake timeout |
+| `4` | Server Error | Remote q exception (`'type`, `'length`, etc.) |
+| `5` | Timeout | Query round-trip exceeded `--timeout` |
+
+With `--json`, errors print as `{"error":"...","kind":"..."}` to stderr.
+
+## Build & Install
+
 ```sh
-q-cli config init --project          # scaffold ./.q-cli.conf
-q-cli config add  --project dev localhost:6000
-q-cli config list                    # merged view, each entry tagged [global]/[project]
-q-cli config path                    # show both layers and which project file is active
-```
-
-Only use project profiles from trusted directories. A repository's `.q-cli.conf`
-can redirect `@prod` to another host. Set `Q_CLI_CONFIG` to a trusted config file
-to disable project overrides.
-
-**Output modes & flags** (default: aligned text, or `Q_CLI_OUT=text|json|csv|console`):
-- `--text` — aligned text table/value output (default; overrides `Q_CLI_OUT`).
-- `--json` / `-j` — JSON. Tables → array of row objects; keyed tables merge
-  key+value columns; temporal types → formatted strings.
-- `--csv` — CSV (tables only, RFC4180-escaped, **uncapped**).
-- `--console` — the q server formats the result with `.Q.s` (max fidelity).
-- `--max-rows N` (or `Q_CLI_MAX_ROWS`) — row cap for text/json (default 50; `0` =
-  unlimited). When a table is capped, a `note: showing N of M rows` is printed to
-  **stderr** so it's machine-detectable; stdout stays pure data.
-- `--timeout MS` (or `Q_CLI_TIMEOUT`) — how long to wait for the **query
-  round-trip** (send + receive), in milliseconds (default `30000`; **`0` = no
-  timeout, wait forever**). Also caps the connect at `min(MS, 5000)`. A timeout on
-  the round-trip fails with `kind:"timeout"` and **exit 5** (the query is too slow —
-  retry / raise the limit / use `0`). A failure to *establish* the connection —
-  refused, unreachable, or a connect/handshake timeout — is **exit 3** instead, so
-  an agent can tell "the query never came back" apart from "can't reach the server".
-- `--readonly` (or `Q_CLI_READONLY=1`) — reject arbitrary q that looks mutating
-  (`delete`/`update`/`insert`/`upsert`/`set`/`hdel`/`hopen`/`hclose`/`system`/
-  `exit`/`dpft`/`0:`/`1:`). A heuristic denylist for `query`/`run`/`time`/`gc`, **not
-  a sandbox** — guards an agent from accidentally mutating data. Keywords inside a
-  string literal (e.g. `… like "*delete*"`) are ignored, so reads aren't
-  false-blocked. It also blocks the
-  server-mutating `web off`/`web get-ok` and `trace on`/`trace off` (which rebind
-  `.z.*` handlers); the `status` forms stay allowed.
-  Computed bracket calls such as `(0)[...]` and chained `f[][ ... ]` calls are
-  rejected. Bracket calls on identifiers inside lambdas are also rejected because
-  an argument or local can hold an IPC handle. This includes local array indexing;
-  parenthesized calls and direct string calls inside lambdas are restricted too.
-  Prefix calls such as `{x y}[0;"..."]` inside lambdas are rejected, including
-  ordinary prefix calls such as `{sum x}[1 2]`. Simple lambdas such as `{x+1}[1]`
-  remain supported.
-- `--scoped` — wrap evaluations (`query`/`time`/`run`) in `{[] ... }[]` so temporary
-  assignments stay local and never pollute server globals.
-- `--atomic` — execute a `.q` script (`run`) as a single protected IPC evaluation
-  instead of statement by statement.
-- `--dry-run` — validate every statement (`query`/`time`/`run`) on the server with
-  `parse` without executing or mutating state.
-- `--tls` (or `Q_CLI_TLS=1` / `tcps://` / `tls://` scheme) — encrypt IPC connection
-  over TLS/SSL (mitigates CWE-319 cleartext credential/query transmission; requires
-  build with `--features tls`). When `Q_CLI_TLS=1` is set in the environment,
-  builds without the `tls` feature will reject connections unless `tcp://` is
-  explicitly used to designate plaintext.
-- `--tls-no-verify`, `--insecure` (or `Q_CLI_TLS_NO_VERIFY=1`) — skip TLS
-  certificate validation (development and testing only; emits a warning to stderr).
-  Note: `SSL_VERIFY_SERVER` is intentionally ignored to prevent unintended MITM
-  exposure from ambient kdb+ client environments.
-
-**Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
-unknown server, readonly block) · `3` connection (refused/unreachable/auth, incl.
-connect/handshake timeout) · `4` q error (server returned `'…`) · `5` timeout (the
-query round-trip exceeded `--timeout`). With `--json`, errors print as
-`{"error":"…","kind":"usage|connect|query|timeout"}` on stderr.
-
-**Subcommands** — `tables` / `meta <t>` / `count <t>` for quick schema discovery;
-`describe <t>` returns partitioning + columns + row count + a small sample for one
-table in **one** call (JSON-friendly); `schema` does the whole DB in one call —
-every table with its row count, column count, and partition field (a fast first
-map of an unknown process); `functions [ns]` lists the functions defined in a
-namespace (root by default, or `.u`, `.Q`, …) with each one's arity, so you can
-reuse server-side helpers instead of reinventing them; `gc` runs `.Q.gc[]`; `info`
-is a health snapshot (version/pid/port/used/heap/peak/handles/timer); `time <expr>`
-returns `ms` + result `count` (not the data) — e.g.
-`q-cli time @ 'select avg price by sym from trade'`.
-
-**`web` — built-in HTTP serving.** A q process serves IPC *and* HTTP on the same
-port, so a browser to `http://host:port/` gets a default page. Tune it at runtime:
-- `q-cli web off    <conn>` — close every HTTP request (GET + POST).
-- `q-cli web get-ok <conn>` — GET returns `200 OK` (body `OK`); POST/other closed.
-- `q-cli web status <conn>` — show the current `.z.ph` / `.z.pp` handlers.
-
-Runtime-only (resets on restart). To persist, put the same lines in the q startup
-script, e.g. for `get-ok`:
-```q
-.z.ph:{.h.hy[`txt;"OK"]};   / HTTP GET  -> 200 OK
-.z.pp:{hclose .z.w};        / HTTP POST -> closed
-```
-
-**`trace` — backtraces on query errors.** By default a failing query returns just
-`'type`; `q-cli trace on <conn>` wraps the IPC handlers with `.Q.trp` so errors
-come back with a `.Q.sbt` call-stack (and also print it to the server console):
-```
-ERR q error 'type
-  [3]  {x+`a}
-         ^
-  [2]  {x+`a}[1]
-```
-`trace on` wraps the existing `.z.pg` and `.z.ps` handlers, so their authorization
-checks still run. `trace off` restores those handlers, including an unset default.
-Repeated `on` calls preserve the first saved handlers; `off` without active tracing
-leaves the server alone. If another tool replaces either handler during tracing,
-`on` and `off` fail instead of overwriting that change (to manually reset, execute
-`delete traceState from `.qcli` on the server).
-Note that tracing wraps message execution with `.Q.trp`, which is intended for debugging;
-detailed backtraces may reveal internal handler stack traces on error.
-
-Trace state is runtime-only and uses the reserved server symbol `.qcli.traceState`.
-Do not modify that symbol while tracing. `trace status` shows the current handlers.
-
-- Errors print `ERR ...` on stderr with a non-zero exit (see exit codes above); a
-  q-side error shows as `ERR q error '<msg>`.
-- `localhost` tries both `::1` and `127.0.0.1` (a q server `-p N` binds IPv4 only).
-
-## How it works
-
-### Server-side access control
-
-Use server-side authentication and authorization as the primary protection.
-The client's `--readonly` checks are a supplementary guard and cannot secure a
-server that accepts arbitrary q expressions.
-
-- Start q with `-U <password-file>` for user/password authentication, or
-  `-u <password-file>` to add restrictions on remote system and file operations.
-  These options do not by themselves make every query read-only.
-- Enforce an allowlist of approved read-only operations in `.z.pg` for synchronous
-  requests and `.z.ps` for asynchronous requests. Keep these authorization handlers
-  in the server startup configuration.
-
-See the KX documentation for [command-line security options](https://code.kx.com/q/basics/cmdline/)
-and [IPC authentication and authorization](https://code.kx.com/q/basics/ipc/).
-
-### Request flow
-
-1. **Handshake** — TCP connect, send `creds + \x03\x00`, read 1-byte capability.
-2. **Sync query** — serialize the expression as a char vector (type 10) inside a
-   sync message (`msgtype=1`), send, read the 8-byte response header + payload.
-3. **Deserialize** — parse the returned K object ([src/k.rs](src/k.rs)).
-4. **Render** — text or JSON ([src/render.rs](src/render.rs)).
-
-Compressed responses (non-loopback, >2 KB) are decompressed via the canonical
-kdb+ algorithm; loopback connections are never compressed.
-
-## Layout
-| file | role |
-|------|------|
-| [src/main.rs](src/main.rs)     | CLI flag parsing and entry point |
-| [src/cmd.rs](src/cmd.rs)       | `CMDS` command table, dispatch, script splitting, and readonly guard |
-| [src/config.rs](src/config.rs) | Server-profile configuration (global and project layers) |
-| [src/conn.rs](src/conn.rs)     | TCP connection, kdb+ handshake, and sync IPC send/recv |
-| [src/error.rs](src/error.rs)   | Error classification (`Kind`, `CliError`) and exit codes |
-| [src/k.rs](src/k.rs)           | K type model, wire deserialization, temporal formatting, decompress |
-| [src/query.rs](src/query.rs)   | Built-in q expressions (`info`, `schema`, `describe`, `functions`, `time`) |
-| [src/render.rs](src/render.rs) | Text, JSON, and CSV rendering |
-
-## Build & install
-```sh
+# Standard build (zero external dependencies)
 cargo build --release
-# Or with TLS support enabled:
+
+# With optional TLS support
 cargo build --release --features tls
 
-cp target/release/q-cli.exe ~/.local/bin/    # (Windows: Copy-Item ... )
+cp target/release/q-cli ~/.local/bin/
 ```
 
-Requires the Rust GNU toolchain on Windows (`stable-x86_64-pc-windows-gnu`) — no
-MSVC build tools needed.
+- **Windows**: Built with OS-native Schannel (no external DLLs required).
+- **Linux**: `--features tls` requires OpenSSL development headers (`libssl-dev` / `openssl-devel`).
+- **macOS**: Built with OS-native Security.framework.
 
-On Linux, building with `--features tls` requires OpenSSL development headers
-(`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora/RHEL). Windows (Schannel)
-and macOS (Security.framework) use OS-native TLS and do not require external packages.
-
-Or install straight from git:
+Install directly from git:
 ```sh
-cargo install --git https://github.com/kdevkr/q-cli
+cargo install --git https://github.com/kdevkr/q-cli --features tls
 ```
 
-## Agent skill (`kdb`)
+## Documentation
 
-This repo also ships a Claude / agent **skill** at [`skills/kdb/SKILL.md`](skills/kdb/SKILL.md)
-that teaches an agent how and when to drive `q-cli`. Install it with the
-[`skills`](https://github.com/vercel-labs/skills) CLI:
-
-```sh
-npx skills add kdevkr/q-cli            # interactive: pick agent(s)
-npx skills add kdevkr/q-cli --list     # list skills in this repo
-npx skills add kdevkr/q-cli -y -g      # non-interactive, install globally
-```
-
-It installs `skills/kdb/SKILL.md` into your agent's skills dir (`.claude/skills/`
-or `.agents/skills/`). The skill needs the `q-cli` binary on PATH — install it
-with the `cargo install` line above.
+- [**Usage Examples (`docs/examples.md`)**](docs/examples.md): Script execution, piping, CSV exports, schema inspection.
+- [**Security & Internals (`docs/security.md`)**](docs/security.md): Readonly guard, TLS configuration, IPC wire protocol.
+- [**Agent Skill (`skills/kdb/SKILL.md`)**](skills/kdb/SKILL.md): Claude / AI agent integration via `npx skills add kdevkr/q-cli -y -g`.
