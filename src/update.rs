@@ -247,7 +247,10 @@ fn download_and_extract_asset(asset: &GithubAsset) -> Result<PathBuf, CliError> 
         .prefix("q-cli-update-")
         .tempfile()
         .map_err(|e| CliError::connect(&format!("failed to create temporary file: {e}")))?;
-    let temp_path = temp_file.path().to_path_buf();
+    let (file, temp_path) = temp_file
+        .keep()
+        .map_err(|e| CliError::connect(&format!("failed to persist temporary file: {e}")))?;
+    drop(file);
 
     if asset_name.ends_with(".zip") {
         extract_zip(&raw_bytes, &temp_path)?;
