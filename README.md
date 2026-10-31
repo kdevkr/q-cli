@@ -101,6 +101,11 @@ to disable project overrides.
   instead of statement by statement.
 - `--dry-run` — validate every statement (`query`/`time`/`run`) on the server with
   `parse` without executing or mutating state.
+- `--tls` (or `Q_CLI_TLS=1` / `tcps://` / `tls://` scheme) — encrypt IPC connection
+  over TLS/SSL (mitigates CWE-319 cleartext credential/query transmission; requires
+  build with `--features tls`).
+- `--tls-no-verify` (or `Q_CLI_TLS_NO_VERIFY=1` / `SSL_VERIFY_SERVER=NO`) — skip
+  TLS certificate validation (development and testing only).
 
 **Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
 unknown server, readonly block) · `3` connection (refused/unreachable/auth, incl.
@@ -201,6 +206,9 @@ kdb+ algorithm; loopback connections are never compressed.
 ## Build & install
 ```sh
 cargo build --release
+# Or with TLS support enabled:
+cargo build --release --features tls
+
 cp target/release/q-cli.exe ~/.local/bin/    # (Windows: Copy-Item ... )
 ```
 

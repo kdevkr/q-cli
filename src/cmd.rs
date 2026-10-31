@@ -48,6 +48,8 @@ pub struct Opts {
     pub scoped: bool,
     pub atomic: bool,              // execute entire script in a single atomic block
     pub dry_run: bool,             // validate syntax on server without mutating state
+    pub tls: bool,                 // connect over TLS/SSL (CWE-319 mitigation)
+    pub tls_no_verify: bool,       // skip TLS certificate verification (dev only)
     pub timeout: Option<Duration>, // None = wait forever; bounds the query round-trip
 }
 
@@ -748,7 +750,7 @@ fn trace_expr(action: &str) -> CmdResult {
 // --- Execution + output ------------------------------------------------------
 
 fn do_ping(conn: &str, opts: &Opts) -> CmdResult {
-    let mut c = Conn::open(conn, opts.timeout)?;
+    let mut c = Conn::open(conn, opts.timeout, opts.tls, opts.tls_no_verify)?;
     let _ = c.sync("1+1")?;
     Ok("pong".to_string())
 }
@@ -924,7 +926,7 @@ fn do_eval(
     stmts: &[QStatement],
     opts: &Opts,
 ) -> CmdResult {
-    let mut c = Conn::open(conn, opts.timeout)?;
+    let mut c = Conn::open(conn, opts.timeout, opts.tls, opts.tls_no_verify)?;
     if opts.readonly {
         if let Some(raw) = guard_raw {
             inspect_remote_funcs(&mut c, raw, 5)?;
@@ -949,7 +951,7 @@ fn do_eval(
 }
 
 fn do_run(conn: &str, content: &str, stmts: &[QStatement], opts: &Opts) -> CmdResult {
-    let mut c = Conn::open(conn, opts.timeout)?;
+    let mut c = Conn::open(conn, opts.timeout, opts.tls, opts.tls_no_verify)?;
 
     if opts.readonly {
         inspect_remote_funcs(&mut c, content, 5)?;
@@ -1881,6 +1883,8 @@ fn usage_string() -> String {
          \x20 --scoped        evaluate inside {[] ... }[] to isolate locals\n\
          \x20 --atomic        run .q script as a single atomic protected block\n\
          \x20 --dry-run       validate syntax on server with parse (zero mutations)\n\
+         \x20 --tls           connect over TLS/SSL (CWE-319; or Q_CLI_TLS=1)\n\
+         \x20 --tls-no-verify skip TLS certificate validation (or Q_CLI_TLS_NO_VERIFY=1)\n\
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );

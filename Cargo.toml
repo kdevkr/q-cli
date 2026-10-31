@@ -14,5 +14,10 @@ lto = true
 strip = true
 panic = "abort"
 
+[features]
+default = []
+tls = ["dep:native-tls"]
+
 [dependencies]
 unicode-width = "0.2.2"
+native-tls = { version = "0.2", optional = true }

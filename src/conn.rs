@@ -12,17 +12,84 @@ use crate::error::CliError;
 use crate::k;
 use crate::k::{Endian, Reader, K};
 
+#[derive(Debug)]
+enum Stream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<native_tls::TlsStream<TcpStream>>),
+}
+
+impl Stream {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_read_timeout(dur),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.get_ref().set_read_timeout(dur),
+        }
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_write_timeout(dur),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.get_ref().set_write_timeout(dur),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
 /// A live IPC connection to a q process.
 #[derive(Debug)]
 pub struct Conn {
-    stream: TcpStream,
+    stream: Stream,
 }
 
 impl Conn {
-    /// Parse `host:port[:user:pass]`, connect, and perform the login handshake.
-    /// `timeout` bounds the query round-trip (socket read/write) and caps connect
-    /// at 5s; `None` means no timeout (block until the server responds).
-    pub fn open(conn: &str, timeout: Option<Duration>) -> Result<Self, CliError> {
+    /// Parse `[tcps://|tls://|tcp://]host:port[:user:pass]`, connect, and perform handshake.
+    /// `timeout` bounds query round-trip (socket read/write) and caps connect at 5s.
+    /// `tls` explicitly enables TLS encryption; `tcps://` or `tls://` scheme also enables it.
+    pub fn open(
+        conn: &str,
+        timeout: Option<Duration>,
+        tls: bool,
+        _tls_no_verify: bool,
+    ) -> Result<Self, CliError> {
+        let use_tls = tls || has_tls_scheme(conn);
+        #[cfg(not(feature = "tls"))]
+        if use_tls {
+            return Err(CliError::usage(
+                "TLS connection requested but q-cli was compiled without 'tls' feature \
+                 (rebuild with --features tls)",
+            ));
+        }
+
         let (host, port, creds) = parse_conn(conn)?;
 
         let addrs: Vec<_> = (host, port)
@@ -68,8 +135,38 @@ impl Conn {
         };
         stream.set_read_timeout(Some(handshake_timeout)).ok();
         stream.set_write_timeout(Some(handshake_timeout)).ok();
-
         stream.set_nodelay(true).ok();
+
+        #[cfg(feature = "tls")]
+        let stream = if use_tls {
+            let mut builder = native_tls::TlsConnector::builder();
+            let skip_verify = _tls_no_verify
+                || std::env::var("SSL_VERIFY_SERVER")
+                    .map(|v| v.eq_ignore_ascii_case("no") || v == "0")
+                    .unwrap_or(false)
+                || std::env::var("Q_CLI_TLS_NO_VERIFY")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            if skip_verify {
+                builder.danger_accept_invalid_certs(true);
+                builder.danger_accept_invalid_hostnames(true);
+            }
+            let connector = builder
+                .build()
+                .map_err(|e| CliError::connect(&format!("TLS initialization failed: {e}")))?;
+            let tls_stream = connector
+                .connect(host, stream)
+                .map_err(|e| {
+                    CliError::connect(&format!("TLS handshake with {host}:{port} failed: {e}"))
+                })?;
+            Stream::Tls(Box::new(tls_stream))
+        } else {
+            Stream::Plain(stream)
+        };
+
+        #[cfg(not(feature = "tls"))]
+        let stream = Stream::Plain(stream);
+
         let mut c = Self { stream };
         c.handshake(&creds)?;
 
@@ -167,19 +264,49 @@ impl Conn {
     }
 }
 
+fn strip_scheme(conn: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = conn.strip_prefix("tcps://") {
+        (rest, Some("tcps://"))
+    } else if let Some(rest) = conn.strip_prefix("tls://") {
+        (rest, Some("tls://"))
+    } else if let Some(rest) = conn.strip_prefix("tcp://") {
+        (rest, Some("tcp://"))
+    } else {
+        (conn, None)
+    }
+}
+
+/// Returns whether a connection string explicitly specifies a TLS scheme (`tcps://` or `tls://`).
+#[must_use]
+pub fn has_tls_scheme(conn: &str) -> bool {
+    conn.starts_with("tcps://") || conn.starts_with("tls://")
+}
+
 /// Mask sensitive credentials from a connection string before reporting in error messages.
 fn mask_err_conn(conn: &str) -> String {
-    // If credentials exist (3rd or 4th colon-separated segment), mask them
-    if let Some((target, rest)) = conn.split_once(':') {
-        if target.starts_with('[') && !target.contains(']') {
-            // Unclosed bracket
-            return "<invalid connection>".to_string();
+    let (conn_no_scheme, scheme) = strip_scheme(conn);
+    let prefix = scheme.unwrap_or("");
+    let (target, rest) = if let Some(stripped) = conn_no_scheme.strip_prefix('[') {
+        if let Some((bracketed, after)) = stripped.split_once(']') {
+            if let Some(after_col) = after.strip_prefix(':') {
+                (format!("[{bracketed}]"), after_col)
+            } else {
+                return format!("{prefix}<invalid connection>");
+            }
+        } else {
+            return format!("{prefix}<invalid connection>");
         }
-        if let Some((_port, _creds)) = rest.split_once(':') {
-            return format!("{target}:<masked>");
-        }
+    } else if let Some((h, after)) = conn_no_scheme.split_once(':') {
+        (h.to_string(), after)
+    } else {
+        return conn.to_string();
+    };
+
+    if let Some((_port, _creds)) = rest.split_once(':') {
+        format!("{prefix}{target}:<masked>")
+    } else {
+        conn.to_string()
     }
-    conn.to_string()
 }
 
 /// Parse `host:port[:user:pass]` or `[ipv6]:port[:user:pass]`.
@@ -189,8 +316,9 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
             "bad connection: contains control characters",
         ));
     }
+    let (conn_no_scheme, _) = strip_scheme(conn);
     let masked = mask_err_conn(conn);
-    let (host, rest) = if let Some(bracketed) = conn.strip_prefix('[') {
+    let (host, rest) = if let Some(bracketed) = conn_no_scheme.strip_prefix('[') {
         let (h, after) = bracketed.split_once(']').ok_or_else(|| {
             CliError::usage(&format!("bad connection '{masked}', missing closing ']'"))
         })?;
@@ -204,7 +332,7 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
         })?;
         (h, after)
     } else {
-        let (h, after) = conn.split_once(':').ok_or_else(|| {
+        let (h, after) = conn_no_scheme.split_once(':').ok_or_else(|| {
             CliError::usage(&format!("bad connection '{masked}', expected host:port"))
         })?;
         let host = if h.is_empty() { "localhost" } else { h };
@@ -349,5 +477,44 @@ mod tests {
         assert!(parse_conn("[::1]:0").is_err());
         assert!(parse_conn("localhost:5000:user:pass\ninjected=evil:5000").is_err());
         assert!(parse_conn("localhost:5000:user\0pass").is_err());
+    }
+
+    #[test]
+    fn parse_conn_with_schemes() {
+        let (host, port, creds) = parse_conn("tcps://localhost:5000").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+        assert!(has_tls_scheme("tcps://localhost:5000"));
+
+        let (host, port, creds) = parse_conn("tls://[::1]:5001:alice:secret").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 5001);
+        assert_eq!(creds, "alice:secret");
+        assert!(has_tls_scheme("tls://[::1]:5001:alice:secret"));
+
+        let (host, port, creds) = parse_conn("tcp://127.0.0.1:5002").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 5002);
+        assert_eq!(creds, "");
+        assert!(!has_tls_scheme("tcp://127.0.0.1:5002"));
+        assert!(!has_tls_scheme("localhost:5000"));
+
+        assert_eq!(
+            mask_err_conn("tcps://localhost:5000:alice:secret"),
+            "tcps://localhost:<masked>"
+        );
+        assert_eq!(
+            mask_err_conn("tls://[::1]:5001:user:pass"),
+            "tls://[::1]:<masked>"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "tls"))]
+    fn open_tls_without_feature_fails_with_usage() {
+        let err = Conn::open("tcps://localhost:5000", None, false, false).unwrap_err();
+        assert_eq!(err.kind, error::Kind::Usage);
+        assert!(err.msg.contains("rebuild with --features tls"));
     }
 }

@@ -52,6 +52,10 @@ fn real_main() -> i32 {
         .unwrap_or(50);
     let mut readonly = std::env::var("Q_CLI_READONLY")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut tls = std::env::var("Q_CLI_TLS")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut tls_no_verify = std::env::var("Q_CLI_TLS_NO_VERIFY")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut scoped = false;
     let mut atomic = false;
     let mut dry_run = false;
@@ -84,6 +88,8 @@ fn real_main() -> i32 {
             "--scoped" => scoped = true,
             "--atomic" => atomic = true,
             "--dry-run" => dry_run = true,
+            "--tls" => tls = true,
+            "--tls-no-verify" | "--insecure" => tls_no_verify = true,
             "--project" | "-p" => project = true,
             "--max-rows" => {
                 i += 1;
@@ -164,6 +170,8 @@ fn real_main() -> i32 {
         scoped,
         atomic,
         dry_run,
+        tls,
+        tls_no_verify,
         // 0 = no timeout (wait forever); otherwise a finite query-round-trip wait.
         timeout: if timeout_ms == 0 {
             None
