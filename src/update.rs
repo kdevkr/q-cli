@@ -285,22 +285,42 @@ fn is_q_cli_bin(name: &str) -> bool {
 }
 
 fn extract_zip(bytes: &[u8], target: &std::path::Path) -> Result<(), CliError> {
-    let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| CliError::connect(&format!("invalid zip archive: {e}")))?;
+    let archive = rawzip::ZipArchive::from_slice(bytes)
+        .map_err(|e| CliError::connect(&format!("invalid zip archive: {e:?}")))?;
 
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| CliError::connect(&format!("failed reading zip entry: {e}")))?;
+    for entry_result in archive.entries() {
+        let entry = entry_result
+            .map_err(|e| CliError::connect(&format!("failed reading zip entry: {e:?}")))?;
+        let name = String::from_utf8_lossy(entry.file_path().as_bytes()).to_ascii_lowercase();
 
-        let name = file.name().to_ascii_lowercase();
         if is_q_cli_bin(&name) {
+            let local_entry = archive
+                .get_entry(entry.wayfinder())
+                .map_err(|e| CliError::connect(&format!("failed locating zip entry: {e:?}")))?;
+
             let mut out = File::create(target)
                 .map_err(|e| CliError::connect(&format!("failed to create target file: {e}")))?;
-            std::io::copy(&mut file, &mut out)
-                .map_err(|e| CliError::connect(&format!("failed to extract binary: {e}")))?;
-            return Ok(());
+
+            match entry.compression_method() {
+                rawzip::CompressionMethod::DEFLATE => {
+                    let mut decoder = flate2::read::DeflateDecoder::new(local_entry.data());
+                    std::io::copy(&mut decoder, &mut out).map_err(|e| {
+                        CliError::connect(&format!("failed decompressing zip entry: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                rawzip::CompressionMethod::STORE => {
+                    out.write_all(local_entry.data()).map_err(|e| {
+                        CliError::connect(&format!("failed writing uncompressed entry: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                other => {
+                    return Err(CliError::connect(&format!(
+                        "unsupported zip compression method: {other:?}"
+                    )));
+                }
+            }
         }
     }
 
@@ -382,11 +402,17 @@ mod tests {
     fn extract_zip_finds_and_unpacks_binary() {
         let mut buf = Vec::new();
         {
-            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let options = zip::write::SimpleFileOptions::default();
-            zip.start_file("q-cli.exe", options).unwrap();
-            zip.write_all(b"dummy-binary-bytes").unwrap();
-            zip.finish().unwrap();
+            let mut writer = rawzip::ZipArchiveWriter::new(&mut buf);
+            let (entry, config) = writer
+                .new_file("q-cli.exe")
+                .compression_method(rawzip::CompressionMethod::STORE)
+                .start()
+                .unwrap();
+            let mut data_writer = config.wrap(entry);
+            data_writer.write_all(b"dummy-binary-bytes").unwrap();
+            let (entry, desc) = data_writer.finish().unwrap();
+            entry.finish(desc).unwrap();
+            writer.finish().unwrap();
         }
         let temp = tempfile::NamedTempFile::new().unwrap();
         let target = temp.path();
