@@ -79,15 +79,18 @@ impl Conn {
         conn: &str,
         timeout: Option<Duration>,
         tls: bool,
-        _tls_no_verify: bool,
+        tls_no_verify: bool,
     ) -> Result<Self, CliError> {
-        let use_tls = tls || has_tls_scheme(conn);
+        let use_tls = resolve_tls(conn, tls);
         #[cfg(not(feature = "tls"))]
-        if use_tls {
-            return Err(CliError::usage(
-                "TLS connection requested but q-cli was compiled without 'tls' feature \
-                 (rebuild with --features tls)",
-            ));
+        {
+            let _ = tls_no_verify;
+            if use_tls {
+                return Err(CliError::usage(
+                    "TLS connection requested but q-cli was compiled without 'tls' feature \
+                     (rebuild with --features tls)",
+                ));
+            }
         }
 
         let (host, port, creds) = parse_conn(conn)?;
@@ -140,14 +143,8 @@ impl Conn {
         #[cfg(feature = "tls")]
         let stream = if use_tls {
             let mut builder = native_tls::TlsConnector::builder();
-            let skip_verify = _tls_no_verify
-                || std::env::var("SSL_VERIFY_SERVER")
-                    .map(|v| v.eq_ignore_ascii_case("no") || v == "0")
-                    .unwrap_or(false)
-                || std::env::var("Q_CLI_TLS_NO_VERIFY")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-            if skip_verify {
+            if tls_no_verify {
+                eprintln!("warning: TLS certificate verification is disabled");
                 builder.danger_accept_invalid_certs(true);
                 builder.danger_accept_invalid_hostnames(true);
             }
@@ -264,28 +261,44 @@ impl Conn {
     }
 }
 
-fn strip_scheme(conn: &str) -> (&str, Option<&str>) {
-    if let Some(rest) = conn.strip_prefix("tcps://") {
-        (rest, Some("tcps://"))
-    } else if let Some(rest) = conn.strip_prefix("tls://") {
-        (rest, Some("tls://"))
-    } else if let Some(rest) = conn.strip_prefix("tcp://") {
-        (rest, Some("tcp://"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    Tcp,
+    Tcps,
+}
+
+fn strip_scheme(conn: &str) -> (&str, Option<Scheme>, &str) {
+    if conn.len() >= 7 && conn[..7].eq_ignore_ascii_case("tcps://") {
+        (&conn[7..], Some(Scheme::Tcps), &conn[..7])
+    } else if conn.len() >= 6 && conn[..6].eq_ignore_ascii_case("tls://") {
+        (&conn[6..], Some(Scheme::Tcps), &conn[..6])
+    } else if conn.len() >= 6 && conn[..6].eq_ignore_ascii_case("tcp://") {
+        (&conn[6..], Some(Scheme::Tcp), &conn[..6])
     } else {
-        (conn, None)
+        (conn, None, "")
     }
 }
 
 /// Returns whether a connection string explicitly specifies a TLS scheme (`tcps://` or `tls://`).
+#[cfg(test)]
 #[must_use]
 pub fn has_tls_scheme(conn: &str) -> bool {
-    conn.starts_with("tcps://") || conn.starts_with("tls://")
+    matches!(strip_scheme(conn).1, Some(Scheme::Tcps))
+}
+
+/// Determine whether TLS should be used: explicit URL scheme takes precedence over `--tls` flag.
+#[must_use]
+pub fn resolve_tls(conn: &str, opts_tls: bool) -> bool {
+    match strip_scheme(conn).1 {
+        Some(Scheme::Tcps) => true,
+        Some(Scheme::Tcp) => false,
+        None => opts_tls,
+    }
 }
 
 /// Mask sensitive credentials from a connection string before reporting in error messages.
 fn mask_err_conn(conn: &str) -> String {
-    let (conn_no_scheme, scheme) = strip_scheme(conn);
-    let prefix = scheme.unwrap_or("");
+    let (conn_no_scheme, _, prefix) = strip_scheme(conn);
     let (target, rest) = if let Some(stripped) = conn_no_scheme.strip_prefix('[') {
         if let Some((bracketed, after)) = stripped.split_once(']') {
             if let Some(after_col) = after.strip_prefix(':') {
@@ -316,7 +329,7 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
             "bad connection: contains control characters",
         ));
     }
-    let (conn_no_scheme, _) = strip_scheme(conn);
+    let (conn_no_scheme, _, _) = strip_scheme(conn);
     let masked = mask_err_conn(conn);
     let (host, rest) = if let Some(bracketed) = conn_no_scheme.strip_prefix('[') {
         let (h, after) = bracketed.split_once(']').ok_or_else(|| {
@@ -500,9 +513,34 @@ mod tests {
         assert!(!has_tls_scheme("tcp://127.0.0.1:5002"));
         assert!(!has_tls_scheme("localhost:5000"));
 
+        // Case-insensitivity check
+        let (host, port, creds) = parse_conn("TCPS://localhost:5000").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5000);
+        assert_eq!(creds, "");
+        assert!(has_tls_scheme("TCPS://localhost:5000"));
+
+        let (host, port, _) = parse_conn("TCP://localhost:5003").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5003);
+
+        // Scheme precedence in resolve_tls
+        assert!(!resolve_tls("tcp://localhost:5000", true));
+        assert!(!resolve_tls("TCP://localhost:5000", true));
+        assert!(resolve_tls("tcps://localhost:5000", false));
+        assert!(resolve_tls("TCPS://localhost:5000", false));
+        assert!(resolve_tls("tls://localhost:5000", false));
+        assert!(resolve_tls("TLS://localhost:5000", false));
+        assert!(resolve_tls("localhost:5000", true));
+        assert!(!resolve_tls("localhost:5000", false));
+
         assert_eq!(
             mask_err_conn("tcps://localhost:5000:alice:secret"),
             "tcps://localhost:<masked>"
+        );
+        assert_eq!(
+            mask_err_conn("TCPS://localhost:5000:alice:secret"),
+            "TCPS://localhost:<masked>"
         );
         assert_eq!(
             mask_err_conn("tls://[::1]:5001:user:pass"),

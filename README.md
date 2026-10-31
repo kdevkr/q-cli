@@ -103,9 +103,13 @@ to disable project overrides.
   `parse` without executing or mutating state.
 - `--tls` (or `Q_CLI_TLS=1` / `tcps://` / `tls://` scheme) — encrypt IPC connection
   over TLS/SSL (mitigates CWE-319 cleartext credential/query transmission; requires
-  build with `--features tls`).
-- `--tls-no-verify` (or `Q_CLI_TLS_NO_VERIFY=1` / `SSL_VERIFY_SERVER=NO`) — skip
-  TLS certificate validation (development and testing only).
+  build with `--features tls`). When `Q_CLI_TLS=1` is set in the environment,
+  builds without the `tls` feature will reject connections unless `tcp://` is
+  explicitly used to designate plaintext.
+- `--tls-no-verify`, `--insecure` (or `Q_CLI_TLS_NO_VERIFY=1`) — skip TLS
+  certificate validation (development and testing only; emits a warning to stderr).
+  Note: `SSL_VERIFY_SERVER` is intentionally ignored to prevent unintended MITM
+  exposure from ambient kdb+ client environments.
 
 **Exit codes** (for scripting / agents): `0` ok · `2` usage/policy (bad args,
 unknown server, readonly block) · `3` connection (refused/unreachable/auth, incl.

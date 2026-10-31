@@ -1884,7 +1884,7 @@ fn usage_string() -> String {
          \x20 --atomic        run .q script as a single atomic protected block\n\
          \x20 --dry-run       validate syntax on server with parse (zero mutations)\n\
          \x20 --tls           connect over TLS/SSL (CWE-319; or Q_CLI_TLS=1)\n\
-         \x20 --tls-no-verify skip TLS certificate validation (or Q_CLI_TLS_NO_VERIFY=1)\n\
+         \x20 --tls-no-verify skip TLS cert validation (or --insecure / Q_CLI_TLS_NO_VERIFY=1)\n\
          \n\
          EXIT: 0 ok · 2 usage/policy · 3 connection · 4 q error · 5 timeout\n",
     );
