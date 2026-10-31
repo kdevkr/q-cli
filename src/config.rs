@@ -411,24 +411,21 @@ fn add(target: &Path, name: &str, conn_str: &str) -> Result<String, String> {
     ))
 }
 
-/// Hide the password/secret component of a `host:port:user:pass` or `host:port:token` string.
+/// Hide the password/secret component of a connection string while preserving its exact format.
 fn mask(conn_str: &str) -> String {
-    if let Ok((host, port, creds)) = conn::parse_conn(conn_str) {
-        if !creds.is_empty() {
-            let host_fmt = if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_string()
-            };
-            if let Some((user, _)) = creds.split_once(':') {
-                format!("{host_fmt}:{port}:{user}:****")
-            } else {
-                format!("{host_fmt}:{port}:****")
-            }
-        } else {
-            conn_str.to_string()
+    if let Ok((_host, _port, creds)) = conn::parse_conn(conn_str) {
+        if creds.is_empty() {
+            return conn_str.to_string();
         }
-    } else if conn_str.contains(':') {
+        let secret = match creds.split_once(':') {
+            Some((_user, pass)) => pass,
+            None => &creds,
+        };
+        if let Some(prefix) = conn_str.strip_suffix(secret) {
+            return format!("{prefix}****");
+        }
+    }
+    if conn_str.contains(':') {
         "<invalid connection>".to_string()
     } else {
         conn_str.to_string()
@@ -472,6 +469,14 @@ mod tests {
         assert_eq!(mask("host:5000:token_only"), "host:5000:****");
         assert_eq!(mask("host:5000"), "host:5000"); // nothing to hide
         assert_eq!(mask("[::1]:5000:user:secret"), "[::1]:5000:user:****");
+        assert_eq!(
+            mask("tcps://host:5000:user:secret"),
+            "tcps://host:5000:user:****"
+        );
+        assert_eq!(
+            mask("tls://[::1]:5000:token_only"),
+            "tls://[::1]:5000:****"
+        );
     }
 
     #[test]

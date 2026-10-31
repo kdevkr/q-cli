@@ -71,6 +71,10 @@ pub struct Conn {
     stream: Stream,
 }
 
+#[cfg(feature = "tls")]
+static WARNED_TLS_NO_VERIFY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Conn {
     /// Parse `[tcps://|tls://|tcp://]host:port[:user:pass]`, connect, and perform handshake.
     /// `timeout` bounds query round-trip (socket read/write) and caps connect at 5s.
@@ -142,10 +146,6 @@ impl Conn {
 
         #[cfg(feature = "tls")]
         let stream = if use_tls {
-            #[cfg(feature = "tls")]
-            static WARNED_TLS_NO_VERIFY: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-
             let mut builder = native_tls::TlsConnector::builder();
             if tls_no_verify {
                 if !WARNED_TLS_NO_VERIFY.swap(true, std::sync::atomic::Ordering::Relaxed) {
