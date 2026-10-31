@@ -323,6 +323,8 @@ fn mask_err_conn(conn: &str) -> String {
 
     if let Some((_port, _creds)) = rest.split_once(':') {
         format!("{prefix}{target}:<masked>")
+    } else if !rest.is_empty() && !rest.chars().all(|c| c.is_ascii_digit()) {
+        format!("{prefix}{target}:<masked>")
     } else {
         conn.to_string()
     }
@@ -363,7 +365,13 @@ pub fn parse_conn(conn: &str) -> Result<(&str, u16, String), CliError> {
         .parse()
         .ok()
         .filter(|&p| p > 0)
-        .ok_or_else(|| CliError::usage(&format!("bad port '{port_str}'")))?;
+        .ok_or_else(|| {
+            if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+                CliError::usage(&format!("bad port '{port_str}' (must be 1..65535)"))
+            } else {
+                CliError::usage(&format!("bad port in '{masked}' (expected 1..65535)"))
+            }
+        })?;
     Ok((host, port, creds.to_string()))
 }
 
@@ -493,6 +501,9 @@ mod tests {
         assert!(!err2.msg.contains("secret"));
         let err3 = parse_conn("localhost:badport:alice:secret").unwrap_err();
         assert!(!err3.msg.contains("secret"));
+        let err4 = parse_conn("localhost:my_secret_token").unwrap_err();
+        assert!(!err4.msg.contains("my_secret_token"));
+        assert!(err4.msg.contains("<masked>"));
         assert!(parse_conn("[::1]:0").is_err());
         assert!(parse_conn("localhost:5000:user:pass\ninjected=evil:5000").is_err());
         assert!(parse_conn("localhost:5000:user\0pass").is_err());
@@ -586,5 +597,17 @@ mod tests {
         let err = Conn::open("tcps://localhost:5000", None, false, false).unwrap_err();
         assert_eq!(err.kind, error::Kind::Usage);
         assert!(err.msg.contains("rebuild with --features tls"));
+    }
+
+    #[test]
+    #[cfg(feature = "tls")]
+    fn tls_connector_accepts_ipv6() {
+        let connector = native_tls::TlsConnector::builder().build().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(50))).ok();
+        let res = connector.connect("::1", stream);
+        assert!(res.is_err());
     }
 }
