@@ -151,7 +151,9 @@ fn format_check_result(latest_tag: &str, is_newer: bool, out: OutMode) -> CmdRes
 }
 
 fn fetch_latest_release() -> Result<GithubRelease, CliError> {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let url = env::var("Q_CLI_UPDATE_URL").unwrap_or_else(|_| {
+        format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+    });
     let output = Command::new("curl")
         .args([
             "-sSfL",
@@ -371,5 +373,78 @@ mod tests {
 
         let matched = find_matching_asset(&assets);
         assert!(matched.is_ok());
+    }
+
+    #[test]
+    fn extract_zip_finds_and_unpacks_binary() {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("q-cli.exe", options).unwrap();
+            zip.write_all(b"dummy-binary-bytes").unwrap();
+            zip.finish().unwrap();
+        }
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let target = temp.path();
+        extract_zip(&buf, target).unwrap();
+        let contents = std::fs::read(target).unwrap();
+        assert_eq!(contents, b"dummy-binary-bytes");
+    }
+
+    #[test]
+    fn extract_tar_gz_finds_and_unpacks_binary() {
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(18);
+            header.set_cksum();
+            tar.append_data(&mut header, "q-cli", b"dummy-tar-gz-bytes" as &[u8]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let target = temp.path();
+        extract_tar_gz(&buf, target).unwrap();
+        let contents = std::fs::read(target).unwrap();
+        assert_eq!(contents, b"dummy-tar-gz-bytes");
+    }
+
+    #[test]
+    fn update_check_with_mock_server() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = stream.read(&mut req);
+                let body = concat!(
+                    "{\"tag_name\":\"v9.9.9\",",
+                    "\"assets\":[{\"name\":\"test\",\"browser_download_url\":\"http://test\"}]}"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let test_url = format!("http://127.0.0.1:{port}/releases/latest");
+        env::set_var("Q_CLI_UPDATE_URL", &test_url);
+
+        let res = run(&["--check".to_string()], &Opts::default()).unwrap();
+        assert!(res.contains("v9.9.9"));
+        assert!(res.contains("A new version of q-cli is available"));
+
+        env::remove_var("Q_CLI_UPDATE_URL");
     }
 }
