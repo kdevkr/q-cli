@@ -4,6 +4,27 @@ A native **kdb+/q IPC client** in Rust. Connects to a running q process over TCP
 speaking the kdb+ wire protocol directly — no `q.exe` or license required.
 Single self-contained binary, cross-platform.
 
+## Build & Install
+
+```sh
+# Standard build (zero external dependencies)
+cargo build --release
+
+# With optional TLS support
+cargo build --release --features tls
+
+cp target/release/q-cli ~/.local/bin/
+```
+
+- **Windows**: Built with OS-native Schannel (no external DLLs required).
+- **Linux**: `--features tls` requires OpenSSL dev headers (`libssl-dev` / `openssl-devel`).
+- **macOS**: Built with OS-native Security.framework.
+
+Install directly from git:
+```sh
+cargo install --git https://github.com/kdevkr/q-cli --features tls
+```
+
 ## Quick Start
 
 ```sh
@@ -21,7 +42,7 @@ q-cli config add prod bigbox:5001:alice:secret
 q-cli query @prod 'select count i from trade'
 ```
 
-> See [**`docs/examples.md`**](docs/examples.md) for advanced queries, script execution, piping, and tuning.
+> See [**`docs/examples.md`**](docs/examples.md) for advanced queries, script execution, and piping.
 
 ## Commands
 
@@ -56,14 +77,14 @@ q-cli query @prod 'select count i from trade'
 | `--console` | `Q_CLI_OUT=console` | Format with server-side `.Q.s` (max fidelity) |
 | `--max-rows N` | `Q_CLI_MAX_ROWS=N` | Row limit for text/json (default `50`; `0` = unlimited) |
 | `--timeout MS` | `Q_CLI_TIMEOUT=MS` | Query timeout in ms (default `30000`; `0` = wait forever) |
-| `--readonly` | `Q_CLI_READONLY=1` | Reject mutating expressions (client-side safety guard) |
+| `--readonly` | `Q_CLI_READONLY=1` | Reject mutating expressions (client safety guard) |
 | `--scoped` | - | Wrap execution in `{[] ... }[]` to isolate locals |
 | `--atomic` | - | Run `.q` script as a single protected IPC transaction |
 | `--dry-run` | - | Validate syntax with server-side `parse` without mutating |
 | `--tls` | `Q_CLI_TLS=1` | Connect over TLS/SSL (mitigates CWE-319) |
-| `--tls-no-verify`, `--insecure` | `Q_CLI_TLS_NO_VERIFY=1` | Skip TLS certificate verification (dev only) |
+| `--tls-no-verify`, `--insecure` | `Q_CLI_TLS_NO_VERIFY=1` | Skip TLS cert verification (dev) |
 
-> Details on `--readonly` mechanics, TLS policies, and server access control are documented in [**`docs/security.md`**](docs/security.md).
+> See [**`docs/security.md`**](docs/security.md) for `--readonly`, TLS, and access control details.
 
 ## Exit Codes
 
@@ -77,29 +98,11 @@ q-cli query @prod 'select count i from trade'
 
 With `--json`, errors print as `{"error":"...","kind":"..."}` to stderr.
 
-## Build & Install
-
-```sh
-# Standard build (zero external dependencies)
-cargo build --release
-
-# With optional TLS support
-cargo build --release --features tls
-
-cp target/release/q-cli ~/.local/bin/
-```
-
-- **Windows**: Built with OS-native Schannel (no external DLLs required).
-- **Linux**: `--features tls` requires OpenSSL development headers (`libssl-dev` / `openssl-devel`).
-- **macOS**: Built with OS-native Security.framework.
-
-Install directly from git:
-```sh
-cargo install --git https://github.com/kdevkr/q-cli --features tls
-```
-
 ## Documentation
 
-- [**Usage Examples (`docs/examples.md`)**](docs/examples.md): Script execution, piping, CSV exports, schema inspection.
-- [**Security & Internals (`docs/security.md`)**](docs/security.md): Readonly guard, TLS configuration, IPC wire protocol.
-- [**Agent Skill (`skills/kdb/SKILL.md`)**](skills/kdb/SKILL.md): Claude / AI agent integration via `npx skills add kdevkr/q-cli -y -g`.
+- [**Usage Examples (`docs/examples.md`)**](docs/examples.md):
+  Script execution, piping, CSV exports, schema inspection.
+- [**Security & Internals (`docs/security.md`)**](docs/security.md):
+  Readonly guard, TLS configuration, IPC wire protocol.
+- [**Agent Skill (`skills/kdb/SKILL.md`)**](skills/kdb/SKILL.md):
+  Claude / AI agent integration via `npx skills add kdevkr/q-cli -y -g`.
