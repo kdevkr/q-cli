@@ -12,6 +12,7 @@ use crate::error::{CliError, CmdResult};
 use crate::k::K;
 use crate::query;
 use crate::render;
+use crate::update;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum OutMode {
@@ -82,6 +83,8 @@ pub enum Spec {
     Action(fn(&str) -> CmdResult),
     /// `<args...>` — no connection (config profile management).
     Config,
+    /// `<args...>` — no connection (self-update from GitHub release).
+    Update,
 }
 
 pub const CMDS: &[Cmd] = &[
@@ -198,6 +201,11 @@ pub const CMDS: &[Cmd] = &[
         help: "<init|path|list|add> [--project]  manage server profiles",
         spec: Spec::Config,
     },
+    Cmd {
+        name: "update",
+        help: "[--check] [--force]          update q-cli to the latest release",
+        spec: Spec::Update,
+    },
 ];
 
 /// Resolve `pos[0]` against `CMDS` and run it, returning the process exit code.
@@ -242,6 +250,10 @@ pub fn dispatch(pos: &[String], opts: &Opts) -> i32 {
     match &cmd.spec {
         Spec::Config => finish(
             config::run(&pos[1..]).map_err(|e| CliError::usage(&e)),
+            opts,
+        ),
+        Spec::Update => finish(
+            update::run(&pos[1..], opts),
             opts,
         ),
         Spec::Action(make) => {

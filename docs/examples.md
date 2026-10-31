@@ -1,6 +1,7 @@
 # q-cli Usage Examples
 
-Comprehensive examples for querying, scripting, formatting, and inspecting kdb+ databases with `q-cli`.
+Comprehensive examples for querying, scripting, formatting, and inspecting
+kdb+ databases with `q-cli`.
 
 ## Basic Queries
 
@@ -102,7 +103,8 @@ q-cli --scoped run @ script.q
 
 ## Server Profiles (`config`)
 
-`q-cli` supports two layers of configuration: global (`~/.config/q-cli/servers.conf`) and project-local (`./.q-cli.conf`).
+`q-cli` supports two configuration layers: global (`~/.config/q-cli/servers.conf`)
+and project-local (`./.q-cli.conf`).
 
 ```sh
 # Initialize global config file
@@ -134,4 +136,23 @@ q-cli web get-ok @      # Allow HTTP GET (200 OK), reject POST
 q-cli trace on @
 q-cli trace status @
 q-cli trace off @
+```
+
+## Self-Update (`update`)
+
+Checks GitHub Releases for `kdevkr/q-cli`, downloads the matching pre-built binary,
+and replaces the running executable in-place without compilation.
+
+```sh
+# Check if an update is available without downloading
+q-cli update --check
+
+# Structured JSON output for CI / agent automation
+q-cli --json update --check
+
+# Self-update to the latest release
+q-cli update
+
+# Force reinstall / update even if already on the latest version
+q-cli update --force
 ```

@@ -25,6 +25,7 @@ mod error;
 mod k;
 mod query;
 mod render;
+mod update;
 
 use cmd::{Opts, OutMode};
 use error::CliError;
@@ -143,7 +144,8 @@ fn real_main() -> i32 {
                 // Allow a leading `-` in `<expr>` position (`pos[2]`) for `query`/`time`
                 // so negative literals or adverbs like `-1+2` or `-0W` work without `--`.
                 let is_query_expr = pos.len() == 2 && matches!(pos[0].as_str(), "query" | "time");
-                if is_query_expr {
+                let is_update_flag = pos.first().map(String::as_str) == Some("update");
+                if is_query_expr || is_update_flag {
                     pos.push(args[i].clone());
                 } else {
                     return usage_err(&format!("unrecognized option '{s}'"), out);

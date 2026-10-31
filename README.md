@@ -25,6 +25,8 @@ Install directly from git:
 cargo install --git https://github.com/kdevkr/q-cli --features tls
 ```
 
+Or self-update anytime via `q-cli update`.
+
 ## Quick Start
 
 ```sh
@@ -64,6 +66,7 @@ q-cli query @prod 'select count i from trade'
 | `web` | `<off\|get-ok\|status> <conn>` | Configure built-in HTTP handling at runtime |
 | `trace` | `<on\|off\|status> <conn>` | Wrap handlers with `.Q.trp` for error call stacks |
 | `config` | `<init\|path\|list\|add> [--project]` | Manage server profiles |
+| `update` | `[--check] [--force]` | Self-update q-cli to the latest release |
 
 `<conn>` accepts `[scheme://]host:port[:user:pass]`, `@profile`, or `@` (default server).
 
