@@ -843,9 +843,11 @@ pub fn decompress(src: &[u8], endian: Endian) -> Result<Vec<u8>, String> {
             src_pos += 1;
             bit_mask = 1;
         }
+        let hash_end;
         if (ctrl_byte & bit_mask) != 0 {
             // back-reference: src[src_pos] selects the copy source, src[src_pos+1] the extra
-            // length; the run copies 2 + that many bytes from earlier in dst.
+            // length; the run copies 2 + that many bytes from earlier in dst. Only its first
+            // 2 bytes are hashed (c.java `p=s1+=n`), or later references resolve wrongly.
             if src_pos + 1 >= src.len() {
                 return Err("decompress overrun (back-reference)".to_string());
             }
@@ -855,6 +857,7 @@ pub fn decompress(src: &[u8], endian: Endian) -> Result<Vec<u8>, String> {
             }
             let mut remaining = src[src_pos + 1] as usize + 2; // 2 + extra length
             src_pos += 2;
+            hash_end = dst_pos + 2;
             while remaining > 0 {
                 if dst_pos >= dst.len() || ref_pos >= dst.len() {
                     return Err("decompress output overrun".to_string());
@@ -871,8 +874,9 @@ pub fn decompress(src: &[u8], endian: Endian) -> Result<Vec<u8>, String> {
             dst[dst_pos] = src[src_pos];
             dst_pos += 1;
             src_pos += 1;
+            hash_end = dst_pos;
         }
-        while hash_pos < dst_pos.saturating_sub(1) {
+        while hash_pos + 1 < hash_end {
             hash_table[(dst[hash_pos] as usize) ^ (dst[hash_pos + 1] as usize)] = hash_pos;
             hash_pos += 1;
         }
@@ -959,6 +963,27 @@ mod tests {
             decompress(&src, Endian::Little).unwrap(),
             vec![10u8, 20, 10, 20, 10, 20]
         );
+    }
+
+    #[test]
+    fn decompress_kdb_payload_with_extended_backreferences() {
+        // Captured from kdb+ 4.1: -18!"\n" sv {x," = ",string y}'[600#("alpha";"beta";"gamma");til 600]
+        // Back-references with extra length are followed by more back-references, so the
+        // hash table must skip the extra bytes exactly as c.java does.
+        let msg = include_bytes!("../testdata/compressed-lines.bin");
+        assert_eq!(msg[2], 1, "fixture must be a compressed message");
+        let body = decompress(&msg[8..], Endian::Little).unwrap();
+        let names = ["alpha", "beta", "gamma"];
+        let text = (0..600)
+            .map(|i| format!("{} = {}", names[i % 3], i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(&body[..2], &[10u8, 0]);
+        assert_eq!(
+            u32::from_le_bytes(body[2..6].try_into().unwrap()) as usize,
+            text.len()
+        );
+        assert_eq!(&body[6..], text.as_bytes());
     }
 
     #[test]
