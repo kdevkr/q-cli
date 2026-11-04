@@ -236,6 +236,17 @@ pub fn run(args: &[String]) -> Result<String, String> {
             }
             add(&target, name, conn_str)
         }
+        "-h" | "--help" | "help" => Ok(
+            "Usage: q-cli config <init|path|list|add> [--project]\n\n\
+             Subcommands:\n  \
+               init                Initialize server configuration file\n  \
+               path                Show path to active configuration file(s)\n  \
+               list                List configured server profiles\n  \
+               add <name> <conn>   Add or update a server profile\n\n\
+             Options:\n  \
+               -p, --project       Operate on project-local .q-cli.conf instead of global"
+                .to_string(),
+        ),
         other => Err(format!(
             "unknown config action '{other}' (init | path | list | add) [--project]"
         )),

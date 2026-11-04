@@ -111,9 +111,16 @@ pub fn run(args: &[String], opts: &Opts) -> CmdResult {
     let temp_bin_path = download_and_extract_asset(asset)?;
 
     self_replace::self_replace(&temp_bin_path).map_err(|e| {
-        CliError::connect(&format!(
-            "failed to replace binary with updated version: {e}"
-        ))
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            CliError::connect(
+                "permission denied replacing binary: please run with elevated / root privileges \
+                 (e.g. 'sudo q-cli update' or run terminal as administrator)",
+            )
+        } else {
+            CliError::connect(&format!(
+                "failed to replace binary with updated version: {e}"
+            ))
+        }
     })?;
 
     // Best-effort cleanup of temp artifact
@@ -157,6 +164,10 @@ fn fetch_latest_release() -> Result<GithubRelease, CliError> {
     let output = Command::new("curl")
         .args([
             "-sSfL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
             "-H",
             "User-Agent: q-cli",
             "-H",
@@ -195,6 +206,30 @@ fn find_matching_asset(assets: &[GithubAsset]) -> Result<&GithubAsset, CliError>
 
     for asset in assets {
         let name = asset.name.to_ascii_lowercase();
+
+        // Skip non-binary metadata and checksum assets
+        if name.ends_with(".sha256")
+            || name.ends_with(".sha512")
+            || name.ends_with(".sig")
+            || name.ends_with(".asc")
+            || name.ends_with(".sbom")
+            || name.ends_with(".txt")
+            || name.ends_with(".json")
+            || name.ends_with(".md")
+        {
+            continue;
+        }
+
+        let is_archive_or_bin = name.ends_with(".zip")
+            || name.ends_with(".tar.gz")
+            || name.ends_with(".tgz")
+            || name.ends_with(".exe")
+            || !name.contains('.');
+
+        if !is_archive_or_bin {
+            continue;
+        }
+
         let matches_os = match os {
             "windows" => name.contains("windows") || name.contains("pc-windows"),
             "linux" => name.contains("linux") || name.contains("unknown-linux"),
@@ -224,6 +259,10 @@ fn download_and_extract_asset(asset: &GithubAsset) -> Result<PathBuf, CliError> 
     let output = Command::new("curl")
         .args([
             "-sSfL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
             "-H",
             "User-Agent: q-cli",
             &asset.browser_download_url,
@@ -381,6 +420,10 @@ mod tests {
     fn asset_matching_logic() {
         let assets = vec![
             GithubAsset {
+                name: "q-cli-x86_64-pc-windows-msvc.zip.sha256".to_string(),
+                browser_download_url: "http://win-sha".to_string(),
+            },
+            GithubAsset {
                 name: "q-cli-x86_64-pc-windows-msvc.zip".to_string(),
                 browser_download_url: "http://win".to_string(),
             },
@@ -394,8 +437,8 @@ mod tests {
             },
         ];
 
-        let matched = find_matching_asset(&assets);
-        assert!(matched.is_ok());
+        let matched = find_matching_asset(&assets).unwrap();
+        assert!(!matched.name.ends_with(".sha256"));
     }
 
     #[test]

@@ -114,8 +114,11 @@ fn real_main() -> i32 {
                 }
             }
             "-h" | "--help" => {
-                cmd::print_help();
-                return 0;
+                if pos.is_empty() {
+                    cmd::print_help();
+                    return 0;
+                }
+                pos.push(a.to_string());
             }
             "-V" | "--version" => {
                 println!("q-cli {}", env!("CARGO_PKG_VERSION"));
@@ -144,8 +147,9 @@ fn real_main() -> i32 {
                 // Allow a leading `-` in `<expr>` position (`pos[2]`) for `query`/`time`
                 // so negative literals or adverbs like `-1+2` or `-0W` work without `--`.
                 let is_query_expr = pos.len() == 2 && matches!(pos[0].as_str(), "query" | "time");
-                let is_update_flag = pos.first().map(String::as_str) == Some("update");
-                if is_query_expr || is_update_flag {
+                let is_subcmd_flag =
+                    !pos.is_empty() && matches!(pos[0].as_str(), "update" | "config");
+                if is_query_expr || is_subcmd_flag {
                     pos.push(args[i].clone());
                 } else {
                     return usage_err(&format!("unrecognized option '{s}'"), out);
