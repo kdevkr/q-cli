@@ -121,8 +121,9 @@ pub fn run(args: &[String], opts: &Opts) -> CmdResult {
     self_replace::self_replace(&temp_bin_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             CliError::connect(
-                "permission denied replacing binary: please run with elevated / root privileges \
-                 (e.g. 'sudo q-cli update' or run terminal as administrator)",
+                "permission denied replacing binary: q-cli is installed where your user cannot \
+                 write. Reinstall it under a user-writable directory (e.g. ~/.local/bin) or \
+                 update it the way it was installed; do not run the updater as root/administrator",
             )
         } else {
             CliError::connect(&format!(

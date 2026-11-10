@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::conn;
@@ -285,13 +286,25 @@ fn write_config_file(target: &Path, content: &str) -> Result<(), String> {
             fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
     }
-    fs::write(target, content).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+    // Profiles can hold passwords: the file must be owner-only before any content
+    // lands in it, whether it is created here or already existed with a looser mode.
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(target, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    Ok(())
+    opts.open(target)
+        .and_then(|mut f| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            f.write_all(content.as_bytes())
+        })
+        .map_err(|e| format!("cannot write {}: {e}", target.display()))
 }
 
 fn init(target: &Path) -> Result<String, String> {
@@ -610,6 +623,21 @@ mod tests {
             assert!(err.contains("<invalid connection>"), "{err}");
         }
         assert_eq!(mask("prod"), "prod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let target =
+            std::env::temp_dir().join(format!("q-cli-mode-test-{}.conf", std::process::id()));
+        // Start from an existing world-readable file: it must be tightened too.
+        fs::write(&target, "old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_file(&target, "prod = localhost:1:u:p\n").unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&target);
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

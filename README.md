@@ -69,6 +69,7 @@ q-cli query @prod 'select count i from trade'
 | `update` | `[--check] [--force]` | Self-update q-cli to the latest release |
 
 `<conn>` accepts `[scheme://]host:port[:user:pass]`, `@profile`, or `@` (default server).
+To keep a password out of the command line, pass `host:port:user` and set `Q_CLI_PASSWORD`.
 
 ## Options & Flags
 

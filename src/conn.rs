@@ -98,6 +98,7 @@ impl Conn {
         }
 
         let (host, port, creds) = parse_conn(conn)?;
+        let creds = with_env_password(creds, std::env::var("Q_CLI_PASSWORD").ok());
 
         let addrs: Vec<_> = (host, port)
             .to_socket_addrs()
@@ -283,6 +284,19 @@ impl Conn {
 enum Scheme {
     Tcp,
     Tcps,
+}
+
+/// `host:port:user` plus `$Q_CLI_PASSWORD` supplies the password without putting it
+/// in argv, where other local processes and shell history can read it. A password
+/// given in the connection string wins.
+fn with_env_password(mut creds: String, env_password: Option<String>) -> String {
+    if let Some(pw) = env_password {
+        if !creds.is_empty() && !creds.contains(':') {
+            creds.push(':');
+            creds.push_str(&pw);
+        }
+    }
+    creds
 }
 
 fn strip_scheme(conn: &str) -> (&str, Option<Scheme>, &str) {
@@ -487,6 +501,15 @@ mod tests {
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 5002);
         assert_eq!(creds, "user:pass:extra");
+    }
+
+    #[test]
+    fn env_password_fills_in_only_a_missing_password() {
+        let pw = || Some("s3cret".to_string());
+        assert_eq!(with_env_password("user".into(), pw()), "user:s3cret");
+        assert_eq!(with_env_password("user:own".into(), pw()), "user:own");
+        assert_eq!(with_env_password(String::new(), pw()), "");
+        assert_eq!(with_env_password("user".into(), None), "user");
     }
 
     #[test]

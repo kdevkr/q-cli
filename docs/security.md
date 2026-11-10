@@ -31,6 +31,8 @@ The text guard below runs first and only gives earlier, clearer errors — it is
 ## Untrusted Config and Servers
 
 - **Project config**: a `.q-cli.conf` found from the current directory overrides global profiles. When it repoints a name that the global config already defines, `q-cli` prints `warning: project <path> overrides global server(s): <names>` on stderr and `config list` tags the entry `[project, overrides global]`, so a checked-out repository cannot silently redirect `prod`.
+- **Credentials**: a password in `host:port:user:pass` on the command line is visible to other local processes and lands in shell history. Prefer `host:port:user` with `Q_CLI_PASSWORD`, or a profile. `Q_CLI_PASSWORD` is sent to whichever host the connection resolves to, so set it per command rather than exporting it, and heed the project-override warning above. Profile files store passwords in plaintext; on Unix they are created `0600`, on Windows they inherit the folder's ACL. Without TLS the login is sent in cleartext (see below).
+- **Self-update**: `q-cli update` replaces its own binary as the current user. If that location is not writable, reinstall under a user-writable directory rather than running the updater as root/administrator.
 - **Response size**: a response larger than 256 MB (after decompression) is rejected; raise the cap with `Q_CLI_MAX_RESPONSE_MB`. The payload buffer grows with the bytes actually received, so a bare length header cannot force a large allocation.
 
 ---
