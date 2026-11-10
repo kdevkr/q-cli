@@ -931,6 +931,18 @@ fn validate_dry_run(
     Ok(())
 }
 
+/// Readonly mode is enforced by the server, not by the text guard above: `reval`
+/// rejects writes, system commands and handle I/O however the expression is spelled
+/// (e.g. `-6!-5!"delete from t"`). Needs kdb+ 3.3+; older servers fail closed.
+fn readonly_wrap(expr: &str, readonly: bool) -> String {
+    if readonly {
+        let escaped = query::q_escape(expr);
+        format!("reval parse \"{escaped}\"")
+    } else {
+        expr.to_string()
+    }
+}
+
 fn do_eval(
     conn: &str,
     expr: &str,
@@ -958,6 +970,8 @@ fn do_eval(
     } else {
         expr.to_string()
     };
+    // Canned commands (info, functions, ...) need `system` and are not user-controlled.
+    let to_send = readonly_wrap(&to_send, opts.readonly && guard_raw.is_some());
     let k = c.sync(&to_send)?;
     Ok(render_output(&k, opts))
 }
@@ -1006,7 +1020,7 @@ fn do_run(conn: &str, content: &str, stmts: &[QStatement], opts: &Opts) -> CmdRe
         } else {
             body
         };
-        let last_k = c.sync(&to_send)?;
+        let last_k = c.sync(&readonly_wrap(&to_send, opts.readonly))?;
         return Ok(render_output(&last_k, opts));
     }
 
@@ -1014,16 +1028,14 @@ fn do_run(conn: &str, content: &str, stmts: &[QStatement], opts: &Opts) -> CmdRe
     let mut last_k = K::Null;
     for (idx, s) in stmts.iter().enumerate() {
         let is_last = idx + 1 == stmts.len();
-        let console_wrapper;
         let to_send = if is_last && opts.out == OutMode::Console {
             let prepared = prepare_stmt_for_block(&s.text);
             let escaped = query::q_escape(&prepared);
-            console_wrapper = format!(".Q.s value \"{escaped}\"");
-            console_wrapper.as_str()
+            format!(".Q.s value \"{escaped}\"")
         } else {
-            s.text.as_str()
+            s.text.clone()
         };
-        match c.sync(to_send) {
+        match c.sync(&readonly_wrap(&to_send, opts.readonly)) {
             Ok(k) => {
                 last_k = k;
             }
@@ -1064,6 +1076,10 @@ pub fn finish(result: CmdResult, opts: &Opts) -> i32 {
         Ok(s) => {
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
+            let s = match opts.out {
+                OutMode::Text | OutMode::Console => render::escape_control(&s),
+                OutMode::Json | OutMode::Csv => s,
+            };
             if let Err(e) = writeln!(handle, "{s}") {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     return 0;
@@ -1079,7 +1095,7 @@ pub fn finish(result: CmdResult, opts: &Opts) -> i32 {
                 let kind_name = e.kind.name();
                 eprintln!("{{\"error\":{err_json},\"kind\":\"{kind_name}\"}}");
             } else {
-                eprintln!("ERR {}", e.msg);
+                eprintln!("ERR {}", render::escape_control(&e.msg));
             }
             e.kind.code()
         }
@@ -1920,6 +1936,15 @@ mod tests {
             readonly: true,
             ..Opts::default()
         }
+    }
+
+    #[test]
+    fn readonly_wrap_delegates_enforcement_to_reval() {
+        assert_eq!(readonly_wrap("count t", false), "count t");
+        assert_eq!(
+            readonly_wrap("-6!-5!\"delete from `t\"", true),
+            "reval parse \"-6!-5!\\\"delete from `t\\\"\""
+        );
     }
 
     #[test]

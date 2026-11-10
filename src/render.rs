@@ -664,6 +664,27 @@ fn float_json(v: f64) -> String {
     }
 }
 
+/// Make server-supplied text safe to print on a terminal: control characters
+/// (ESC, CR, BEL, C1, ...) become visible `\x1b`-style escapes so data cannot
+/// drive the terminal. Newlines, tabs and CRLF line ends are kept.
+#[must_use]
+pub fn escape_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let keep = !c.is_control()
+            || c == '\n'
+            || c == '\t'
+            || (c == '\r' && chars.peek() == Some(&'\n'));
+        if keep {
+            out.push(c);
+        } else {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        }
+    }
+    out
+}
+
 /// JSON-escape a string (public so error output can reuse it).
 #[must_use]
 pub fn json_string(s: &str) -> String {
@@ -736,6 +757,14 @@ mod tests {
     #[test]
     fn json_respects_max_rows() {
         assert_eq!(to_json(&sample_table(), 1), r#"[{"a":1,"b":"x"}]"#);
+    }
+
+    #[test]
+    fn escape_control_neutralises_terminal_sequences() {
+        assert_eq!(escape_control("plain\ttext\nline2\r\n"), "plain\ttext\nline2\r\n");
+        assert_eq!(escape_control("\u{1b}[31mRED\u{7}"), "\\x1b[31mRED\\x07");
+        assert_eq!(escape_control("over\rwrite"), "over\\x0dwrite");
+        assert_eq!(escape_control("c1\u{9b}2J"), "c1\\x9b2J");
     }
 
     #[test]

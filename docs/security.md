@@ -15,7 +15,9 @@ Refer to the official KX documentation for [Command-line Security Options](https
 
 ## Client-Side `--readonly` Guard
 
-When `--readonly` (or `Q_CLI_READONLY=1`) is enabled, `q-cli` inspects expressions before transmission and blocks:
+When `--readonly` (or `Q_CLI_READONLY=1`) is enabled, user-supplied expressions (`query`, `time`, `run`) are sent as `reval parse "<expr>"`, so the **server** rejects writes, system commands, and handle I/O (`'noupdate` / `'sys`) however the expression is spelled. This requires kdb+ 3.3+; older servers fail closed with `'reval`.
+
+The text guard below runs first and only gives earlier, clearer errors — it is not the security boundary (e.g. `-6!-5!"delete from t"` passes it and is stopped by `reval`). `q-cli` inspects expressions before transmission and blocks:
 
 - **Mutating keywords**: `delete`, `update`, `insert`, `upsert`, `set`, `hdel`, `hopen`, `hclose`, `system`, `exit`, `dpft`, `0:`, `1:`, `2:`, `3:`, `value`, `get`, `eval`, `save`, `load`.
 - **System commands**: Any backslash statement (`\cd`, `\p`, `\rm`, etc.).
@@ -61,4 +63,4 @@ When `--readonly` (or `Q_CLI_READONLY=1`) is enabled, `q-cli` inspects expressio
 1. **Connection & Handshake**: TCP connect (capped at 5s), optional TLS handshake, send credentials byte sequence (`creds + \x03\x00`), validate 1-byte capability response.
 2. **Synchronous Query**: Serialize expression as a char vector (type 10) inside a sync message (`msgtype = 1`), send, and read the 8-byte response header + payload.
 3. **Deserialization**: Parse the returned K object ([src/k.rs](../src/k.rs)).
-4. **Rendering**: Format into text, JSON, or CSV ([src/render.rs](../src/render.rs)).
+4. **Rendering**: Format into text, JSON, or CSV ([src/render.rs](../src/render.rs)). Text and console output (and error messages) escape control characters such as ESC as `\x1b` so server data cannot drive the terminal; JSON escapes them per the JSON spec, and CSV is emitted unmodified.
