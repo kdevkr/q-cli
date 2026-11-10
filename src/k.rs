@@ -64,6 +64,20 @@ pub const NULL_LONG: i64 = i64::MIN;
 
 pub const MAX_READ_DEPTH: usize = 128;
 
+/// Largest response accepted, compressed or not. A server controls both the
+/// length header and the compression ratio (a few MB can expand ~120x), so this
+/// bounds what a hostile or wrong endpoint can make the client allocate.
+/// Default 256 MB; raise with `Q_CLI_MAX_RESPONSE_MB`.
+#[must_use]
+pub fn max_message_len() -> usize {
+    std::env::var("Q_CLI_MAX_RESPONSE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(256)
+        .saturating_mul(1024 * 1024)
+}
+
 #[inline]
 fn safe_cap(n: usize) -> usize {
     n.min(65536)
@@ -820,9 +834,12 @@ pub fn decompress(src: &[u8], endian: Endian) -> Result<Vec<u8>, String> {
     if usize_total < 8 {
         return Err("bad uncompressed size".to_string());
     }
-    const MAX_UNCOMPRESSED_SIZE: usize = 1024 * 1024 * 1024; // 1GB limit
-    if usize_total > MAX_UNCOMPRESSED_SIZE {
-        return Err(format!("uncompressed size {usize_total} exceeds 1GB limit"));
+    let max = max_message_len();
+    if usize_total > max {
+        return Err(format!(
+            "uncompressed size {usize_total} exceeds the {} MB limit (Q_CLI_MAX_RESPONSE_MB)",
+            max / (1024 * 1024)
+        ));
     }
     let mut dst = vec![0u8; usize_total - 8];
     let mut hash_table = [0usize; 256];

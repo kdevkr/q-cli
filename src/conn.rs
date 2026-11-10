@@ -247,16 +247,28 @@ impl Conn {
         if len < 8 {
             return Err(CliError::connect(&format!("invalid response length {len}")));
         }
-        const MAX_MSG_LEN: usize = 1024 * 1024 * 1024; // 1 GB cap prevents OOM on non-kdb ports
-        if len > MAX_MSG_LEN {
+        let max = k::max_message_len();
+        if len > max {
             return Err(CliError::connect(&format!(
-                "response length {len} exceeds 1GB limit (rogue port or invalid message)"
+                "response length {len} exceeds the {} MB limit \
+                 (rogue port, invalid message, or raise Q_CLI_MAX_RESPONSE_MB)",
+                max / (1024 * 1024)
             )));
         }
-        let mut payload = vec![0u8; len - 8];
-        self.stream
-            .read_exact(&mut payload)
+        // Grow with the bytes that actually arrive: the header alone must not
+        // make us allocate the size it claims.
+        let want = len - 8;
+        let mut payload = Vec::new();
+        let got = (&mut self.stream)
+            .take(want as u64)
+            .read_to_end(&mut payload)
             .map_err(|e| error::io_err("truncated response", &e))?;
+        if got != want {
+            return Err(error::io_err(
+                "truncated response",
+                &std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            ));
+        }
 
         if compressed {
             payload = k::decompress(&payload, endian).map_err(|e| CliError::query(&e))?;

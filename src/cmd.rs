@@ -1907,6 +1907,7 @@ fn usage_string() -> String {
          \x20 --console       let the q server format via .Q.s\n\
          \x20 --max-rows N    row cap for text/json (0 = unlimited; or Q_CLI_MAX_ROWS)\n\
          \x20 --timeout MS    query wait in ms (default 30000; or Q_CLI_TIMEOUT)\n\
+         \x20 Q_CLI_MAX_RESPONSE_MB  largest response accepted, in MB (default 256)\n\
          \x20 --readonly      reject mutating q (or set Q_CLI_READONLY=1)\n\
          \x20 --scoped        evaluate inside {[] ... }[] to isolate locals\n\
          \x20 --atomic        run .q script as a single atomic protected block\n\

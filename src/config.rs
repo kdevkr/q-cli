@@ -130,6 +130,16 @@ fn load_merged() -> Result<HashMap<String, String>, String> {
     }
     if let Some(pp) = project_path_read() {
         if let Ok(p) = load_file(&pp) {
+            let names = overridden(&map, &p);
+            if !names.is_empty() {
+                // Path and names come from an untrusted file: escape before printing.
+                let msg = format!(
+                    "warning: project {} overrides global server(s): {}",
+                    pp.display(),
+                    names.join(", ")
+                );
+                eprintln!("{}", crate::render::escape_control(&msg));
+            }
             map.extend(p); // project overrides global
         }
     }
@@ -141,6 +151,22 @@ fn load_merged() -> Result<HashMap<String, String>, String> {
         ));
     }
     Ok(map)
+}
+
+/// Names a project file redefines to a different target than the global config.
+/// A `.q-cli.conf` in a checked-out repo can silently repoint `prod`, so callers
+/// surface these instead of trusting the overlay blindly.
+fn overridden<'a>(
+    global: &HashMap<String, String>,
+    project: &'a HashMap<String, String>,
+) -> Vec<&'a str> {
+    let mut names: Vec<&str> = project
+        .iter()
+        .filter(|(k, v)| global.get(*k).is_some_and(|g| g != *v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 pub fn resolve_conn(token: &str) -> Result<String, String> {
@@ -322,7 +348,13 @@ fn list() -> String {
         if let Some(pp) = project_path_read() {
             if let Ok(p) = load_file(&pp) {
                 for (k, v) in p {
-                    rows.insert(k, (v, "project"));
+                    let shadows = rows.get(&k).is_some_and(|(g, _)| *g != v);
+                    let src = if shadows {
+                        "project, overrides global"
+                    } else {
+                        "project"
+                    };
+                    rows.insert(k, (v, src));
                 }
             }
         }
@@ -488,6 +520,23 @@ mod tests {
             mask("tls://[::1]:5000:token_only"),
             "tls://[::1]:5000:****"
         );
+    }
+
+    #[test]
+    fn overridden_lists_only_changed_global_names() {
+        let to_map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let global = to_map(&[("prod", "bigbox:5001"), ("local", "localhost:5000")]);
+        let project = to_map(&[
+            ("prod", "evil:5001"),
+            ("local", "localhost:5000"),
+            ("extra", "h:1"),
+        ]);
+        assert_eq!(overridden(&global, &project), vec!["prod"]);
     }
 
     #[test]

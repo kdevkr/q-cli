@@ -28,6 +28,11 @@ The text guard below runs first and only gives earlier, clearer errors — it is
 - **Lambda scoping**: Calls on identifiers inside lambdas are restricted to prevent indirect IPC handle execution. Keywords inside string literals (e.g. `where text like "*delete*"`) are ignored to avoid false positives.
 - **Server mutations**: Blocks `web off`, `web get-ok`, `trace on`, and `trace off` (which rebind `.z.*` handlers); `status` queries remain allowed.
 
+## Untrusted Config and Servers
+
+- **Project config**: a `.q-cli.conf` found from the current directory overrides global profiles. When it repoints a name that the global config already defines, `q-cli` prints `warning: project <path> overrides global server(s): <names>` on stderr and `config list` tags the entry `[project, overrides global]`, so a checked-out repository cannot silently redirect `prod`.
+- **Response size**: a response larger than 256 MB (after decompression) is rejected; raise the cap with `Q_CLI_MAX_RESPONSE_MB`. The payload buffer grows with the bytes actually received, so a bare length header cannot force a large allocation.
+
 ---
 
 ## TLS / SSL Encryption (CWE-319 Mitigation)

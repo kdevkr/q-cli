@@ -80,6 +80,7 @@ q-cli query @prod 'select count i from trade'
 | `--console` | `Q_CLI_OUT=console` | Format with server-side `.Q.s` (max fidelity) |
 | `--max-rows N` | `Q_CLI_MAX_ROWS=N` | Row limit for text/json (default `50`; `0` = unlimited) |
 | `--timeout MS` | `Q_CLI_TIMEOUT=MS` | Query timeout in ms (default `30000`; `0` = wait forever) |
+| - | `Q_CLI_MAX_RESPONSE_MB=N` | Largest response accepted, after decompression (default `256`) |
 | `--readonly` | `Q_CLI_READONLY=1` | Reject mutating expressions (client safety guard) |
 | `--scoped` | - | Wrap execution in `{[] ... }[]` to isolate locals |
 | `--atomic` | - | Run `.q` script as a single protected IPC transaction |
