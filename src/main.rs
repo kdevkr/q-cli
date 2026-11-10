@@ -72,6 +72,14 @@ fn real_main() -> i32 {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        // A leading `-` is data in `<expr>` position (`pos[2]`) of `query`/`time`, so
+        // negative literals like `-1+2` or `-0W` work without `--`; `update` and
+        // `config` parse their own flags (including `-h`).
+        let takes_dash = match pos.first().map(String::as_str) {
+            Some("query" | "time") => pos.len() == 2,
+            Some("update" | "config") => true,
+            _ => false,
+        };
         match a {
             "--" => {
                 i += 1;
@@ -113,12 +121,9 @@ fn real_main() -> i32 {
                     }
                 }
             }
-            "-h" | "--help" => {
-                if pos.is_empty() {
-                    cmd::print_help();
-                    return 0;
-                }
-                pos.push(a.to_string());
+            "-h" | "--help" if !takes_dash => {
+                cmd::print_help();
+                return 0;
             }
             "-V" | "--version" => {
                 println!("q-cli {}", env!("CARGO_PKG_VERSION"));
@@ -144,12 +149,7 @@ fn real_main() -> i32 {
                 }
             }
             s if s.starts_with('-') && s != "-" => {
-                // Allow a leading `-` in `<expr>` position (`pos[2]`) for `query`/`time`
-                // so negative literals or adverbs like `-1+2` or `-0W` work without `--`.
-                let is_query_expr = pos.len() == 2 && matches!(pos[0].as_str(), "query" | "time");
-                let is_subcmd_flag =
-                    !pos.is_empty() && matches!(pos[0].as_str(), "update" | "config");
-                if is_query_expr || is_subcmd_flag {
+                if takes_dash {
                     pos.push(args[i].clone());
                 } else {
                     return usage_err(&format!("unrecognized option '{s}'"), out);

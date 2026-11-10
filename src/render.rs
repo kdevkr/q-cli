@@ -453,19 +453,40 @@ pub fn to_csv(val: &K) -> String {
     };
     let nrows = cols.first().copied().map_or(0, k::len_of);
     let mut out = String::new();
-    let header_fields: Vec<String> = names.iter().map(|n| csv_field(n)).collect();
+    let header_fields: Vec<String> = names
+        .iter()
+        .map(|n| csv_field(&defuse_formula(n.to_string())))
+        .collect();
     out.push_str(&header_fields.join(","));
     out.push('\n');
     for i in 0..nrows {
         let row: Vec<String> = cols
             .iter()
-            .map(|&c| csv_field(&scalar_to_csv(&k::at(c, i))))
+            .map(|&c| {
+                let cell = k::at(c, i);
+                let text = scalar_to_csv(&cell);
+                // Only text cells: a numeric `-5` must stay a number.
+                if matches!(cell, K::Symbol(_) | K::CharV(_) | K::Char(_)) {
+                    csv_field(&defuse_formula(text))
+                } else {
+                    csv_field(&text)
+                }
+            })
             .collect();
         out.push_str(&row.join(","));
         out.push('\n');
     }
     out.pop();
     out
+}
+
+/// Spreadsheet apps run a cell starting with `=`, `+`, `-`, `@`, tab or CR as a
+/// formula (`=cmd|'/c calc'!A1`). Prefixing `'` makes them show it as text.
+fn defuse_formula(mut s: String) -> String {
+    if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        s.insert(0, '\'');
+    }
+    s
 }
 
 fn csv_field(s: &str) -> String {
@@ -894,6 +915,18 @@ mod tests {
             compact_vec(&K::BoolV(vec![true, false, true, false]), 2),
             "10b..."
         );
+    }
+
+    #[test]
+    fn csv_defuses_formula_text_but_not_numbers() {
+        let table = K::Table(Box::new(K::Dict(
+            Box::new(K::SymbolV(vec!["=h".into(), "n".into()])),
+            Box::new(K::List(vec![
+                K::SymbolV(vec!["=cmd|'/c calc'!A1".into(), "ok".into()]),
+                K::LongV(vec![-5, 1]),
+            ])),
+        )));
+        assert_eq!(to_csv(&table), "'=h,n\n'=cmd|'/c calc'!A1,-5\nok,1");
     }
 
     #[test]
