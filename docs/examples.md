@@ -141,7 +141,10 @@ q-cli trace off @
 ## Self-Update (`update`)
 
 Checks GitHub Releases for `kdevkr/q-cli`, downloads the matching pre-built binary,
-and replaces the running executable in-place without compilation.
+and replaces the running executable in-place without compilation. Downloads are
+HTTPS-only (redirects included), restricted to this repository's release URLs, and
+verified against GitHub's SHA-256 asset digest before the binary is replaced; an
+asset without a digest is never installed.
 
 ```sh
 # Check if an update is available without downloading

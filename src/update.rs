@@ -25,10 +25,17 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
+/// curl protocol allow-list (`--proto` / `--proto-redir`). Tests talk to a local
+/// plain-HTTP mock server; release builds only ever speak HTTPS, redirects included.
+const CURL_PROTO: &str = if cfg!(test) { "=http,https" } else { "=https" };
+
 #[derive(Debug, Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+    /// `sha256:<hex>` digest GitHub computes for every uploaded asset.
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,7 +115,8 @@ pub fn run(args: &[String], opts: &Opts) -> CmdResult {
     }
 
     let asset = find_matching_asset(&release.assets)?;
-    let temp_bin_path = download_and_extract_asset(asset)?;
+    let checksum = expected_sha256(asset)?;
+    let temp_bin_path = download_and_extract_asset(asset, &checksum)?;
 
     self_replace::self_replace(&temp_bin_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -157,13 +165,105 @@ fn format_check_result(latest_tag: &str, is_newer: bool, out: OutMode) -> CmdRes
     }
 }
 
-fn fetch_latest_release() -> Result<GithubRelease, CliError> {
-    let url = env::var("Q_CLI_UPDATE_URL").unwrap_or_else(|_| {
-        format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
-    });
+/// GitHub API endpoint for the latest release. Only test builds honour the
+/// `Q_CLI_UPDATE_URL` override, so a stray environment variable can never point
+/// a real install at another server.
+#[cfg(not(test))]
+fn release_api_url() -> String {
+    format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+}
+
+#[cfg(test)]
+fn release_api_url() -> String {
+    env::var("Q_CLI_UPDATE_URL")
+        .unwrap_or_else(|_| format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest"))
+}
+
+/// Release assets must be served from this repository's GitHub release downloads.
+/// Also guarantees the URL cannot be mistaken for a curl option.
+fn validate_download_url(url: &str) -> Result<(), CliError> {
+    let prefix = format!("https://github.com/{GITHUB_REPO}/releases/download/");
+    // `..` would let curl's path normalisation escape the prefix to another repo.
+    if url.starts_with(&prefix) && !url.contains("..") {
+        Ok(())
+    } else {
+        Err(CliError::connect(&format!(
+            "refusing to download release asset from unexpected URL '{url}' \
+             (expected {prefix}...)"
+        )))
+    }
+}
+
+/// Download an HTTPS release asset (redirects stay on HTTPS) and return its bytes.
+fn curl_download(url: &str, name: &str) -> Result<Vec<u8>, CliError> {
+    validate_download_url(url)?;
     let output = Command::new("curl")
         .args([
             "-sSfL",
+            "--proto",
+            CURL_PROTO,
+            "--proto-redir",
+            CURL_PROTO,
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            "-H",
+            "User-Agent: q-cli",
+            url,
+        ])
+        .output()
+        .map_err(|e| CliError::connect(&format!("failed to download {name}: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::connect(&format!(
+            "failed downloading {name}: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// Expected SHA-256 of `asset`, from the digest GitHub computes for every release
+/// asset. Fails closed when it is missing or not a SHA-256.
+fn expected_sha256(asset: &GithubAsset) -> Result<String, CliError> {
+    let Some(digest) = &asset.digest else {
+        return Err(CliError::connect(&format!(
+            "no SHA-256 digest published for {}; refusing to install an unverified binary",
+            asset.name
+        )));
+    };
+    match digest.strip_prefix("sha256:") {
+        Some(hex) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(hex.to_ascii_lowercase())
+        }
+        _ => Err(CliError::connect(&format!(
+            "unsupported digest '{digest}' for {}",
+            asset.name
+        ))),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for b in Sha256::digest(bytes) {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+fn fetch_latest_release() -> Result<GithubRelease, CliError> {
+    let url = release_api_url();
+    let output = Command::new("curl")
+        .args([
+            "-sSfL",
+            "--proto",
+            CURL_PROTO,
+            "--proto-redir",
+            CURL_PROTO,
             "--connect-timeout",
             "10",
             "--max-time",
@@ -255,31 +355,19 @@ fn find_matching_asset(assets: &[GithubAsset]) -> Result<&GithubAsset, CliError>
     )))
 }
 
-fn download_and_extract_asset(asset: &GithubAsset) -> Result<PathBuf, CliError> {
-    let output = Command::new("curl")
-        .args([
-            "-sSfL",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "60",
-            "-H",
-            "User-Agent: q-cli",
-            &asset.browser_download_url,
-        ])
-        .output()
-        .map_err(|e| CliError::connect(&format!("failed to download release asset: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+fn download_and_extract_asset(
+    asset: &GithubAsset,
+    expected_sha256: &str,
+) -> Result<PathBuf, CliError> {
+    let raw_bytes = curl_download(&asset.browser_download_url, &asset.name)?;
+    let actual_sha256 = sha256_hex(&raw_bytes);
+    if actual_sha256 != expected_sha256 {
         return Err(CliError::connect(&format!(
-            "failed downloading {}: {}",
-            asset.name,
-            stderr.trim()
+            "checksum mismatch for {}: expected sha256 {expected_sha256}, got {actual_sha256}",
+            asset.name
         )));
     }
 
-    let raw_bytes = output.stdout;
     let asset_name = asset.name.to_ascii_lowercase();
 
     let temp_file = tempfile::Builder::new()
@@ -422,23 +510,83 @@ mod tests {
             GithubAsset {
                 name: "q-cli-x86_64-pc-windows-msvc.zip.sha256".to_string(),
                 browser_download_url: "http://win-sha".to_string(),
+                digest: None,
             },
             GithubAsset {
                 name: "q-cli-x86_64-pc-windows-msvc.zip".to_string(),
                 browser_download_url: "http://win".to_string(),
+                digest: None,
             },
             GithubAsset {
                 name: "q-cli-x86_64-unknown-linux-gnu.tar.gz".to_string(),
                 browser_download_url: "http://linux".to_string(),
+                digest: None,
             },
             GithubAsset {
                 name: "q-cli-aarch64-apple-darwin.tar.gz".to_string(),
                 browser_download_url: "http://mac".to_string(),
+                digest: None,
             },
         ];
 
         let matched = find_matching_asset(&assets).unwrap();
         assert!(!matched.name.ends_with(".sha256"));
+    }
+
+    #[test]
+    fn download_url_must_be_this_repos_release() {
+        assert!(validate_download_url(
+            "https://github.com/kdevkr/q-cli/releases/download/v0.1.2/q-cli-x86_64-pc-windows-msvc.zip"
+        )
+        .is_ok());
+        for bad in [
+            "http://github.com/kdevkr/q-cli/releases/download/v0.1.2/q-cli.zip",
+            "https://github.com/evil/q-cli/releases/download/v0.1.2/q-cli.zip",
+            "https://evil.example/kdevkr/q-cli/releases/download/q-cli.zip",
+            "-o/tmp/x https://github.com/kdevkr/q-cli/releases/download/q-cli.zip",
+            "file:///etc/passwd",
+            "https://github.com/kdevkr/q-cli/releases/download/../../../evil/x/releases/download/a",
+        ] {
+            assert!(validate_download_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn expected_sha256_from_github_digest() {
+        let hex = "1529BA9ED983BBBAD50FC6AB0B4939DC7CF01C16EEDC75A941F0ECD31B12037E";
+        let asset = GithubAsset {
+            name: "q-cli-x86_64-pc-windows-msvc.zip".to_string(),
+            browser_download_url: "https://github.com/kdevkr/q-cli/releases/download/v0.1.2/x"
+                .to_string(),
+            digest: Some(format!("sha256:{hex}")),
+        };
+        assert_eq!(expected_sha256(&asset).unwrap(), hex.to_ascii_lowercase());
+
+        let bad = GithubAsset {
+            digest: Some("sha1:abc".to_string()),
+            ..asset
+        };
+        assert!(expected_sha256(&bad).is_err());
+    }
+
+    #[test]
+    fn expected_sha256_fails_closed_without_checksum() {
+        let asset = GithubAsset {
+            name: "q-cli-x86_64-pc-windows-msvc.zip".to_string(),
+            browser_download_url: "https://github.com/kdevkr/q-cli/releases/download/v0.1.2/x"
+                .to_string(),
+            digest: None,
+        };
+        let err = expected_sha256(&asset).unwrap_err();
+        assert!(err.msg.contains("refusing to install"));
     }
 
     #[test]
