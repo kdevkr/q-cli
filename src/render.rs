@@ -449,7 +449,8 @@ fn render_dict(keys: &K, vals: &K, max: usize) -> String {
 #[must_use]
 pub fn to_csv(val: &K) -> String {
     let Some((names, cols)) = table_parts(val) else {
-        return to_text(val, 0);
+        // Not CSV at all, so it gets the same terminal protection as text output.
+        return escape_control(&to_text(val, 0));
     };
     let nrows = cols.first().copied().map_or(0, k::len_of);
     let mut out = String::new();
@@ -927,6 +928,13 @@ mod tests {
             ])),
         )));
         assert_eq!(to_csv(&table), "'=h,n\n'=cmd|'/c calc'!A1,-5\nok,1");
+    }
+
+    #[test]
+    fn csv_non_table_fallback_escapes_control_chars() {
+        let esc = char::from(27);
+        let out = to_csv(&K::Symbol(format!("a{esc}[31mb")));
+        assert!(!out.contains(esc), "{out}");
     }
 
     #[test]

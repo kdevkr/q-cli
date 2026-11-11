@@ -831,7 +831,7 @@ fn inspect_remote_funcs(conn: &mut Conn, expr: &str, max_depth: usize) -> Result
                t:type v;\n\
                if[(t >= 100h) and t <= 112h;\n\
                  s1:@[.Q.s1; v; \"\"];\n\
-                 raw:ssr[ssr[ssr[s1; \"(::)\"; \" \"]; \"[::\"; \"[\"]; \";::\"; \";\"];\n\
+                 raw:ssr[ssr[ssr[s1; \"(::)\"; \" \"]; \"[[]::\"; \"[\"]; \";::\"; \";\"];\n\
                  if[raw like \"*.z.w*\"; violator:string curr];\n\
                  src:lower raw;\n\
                  globals:$[t = 100h; \

@@ -82,7 +82,7 @@ To keep a password out of the command line, pass `host:port:user` and set `Q_CLI
 | `--max-rows N` | `Q_CLI_MAX_ROWS=N` | Row limit for text/json (default `50`; `0` = unlimited) |
 | `--timeout MS` | `Q_CLI_TIMEOUT=MS` | Query timeout in ms (default `30000`; `0` = wait forever) |
 | - | `Q_CLI_MAX_RESPONSE_MB=N` | Largest response accepted, after decompression (default `256`) |
-| `--readonly` | `Q_CLI_READONLY=1` | Reject mutating expressions (client safety guard) |
+| `--readonly` | `Q_CLI_READONLY=1` | Enforce read-only on the server via `reval` (kdb+ 3.3+) |
 | `--scoped` | - | Wrap execution in `{[] ... }[]` to isolate locals |
 | `--atomic` | - | Run `.q` script as a single protected IPC transaction |
 | `--dry-run` | - | Validate syntax with server-side `parse` without mutating |
